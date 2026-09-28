@@ -212,6 +212,10 @@ private final class BookPaperView: UIView {
 
     if let layout, layout.ranges.indices.contains(pageIndex) {
       context.saveGState()
+      // UIKit may leave a flipped text matrix in the drawing context. Core Text
+      // also needs the coordinate system below to be flipped, so reset the text
+      // matrix first or every glyph is rendered upside down/mirrored.
+      context.textMatrix = .identity
       context.translateBy(x: 0, y: bounds.height)
       context.scaleBy(x: 1, y: -1)
       let frame = CTFramesetterCreateFrame(

@@ -90,6 +90,7 @@ reader = (root / "App/BookPages.swift").read_text()
 assert reader.count("ReadingFont(id:") >= 10, "Reader must expose at least ten readable fonts"
 assert ".pageCurl" in reader and ".scroll" in reader, "Reader needs curl and reduced-motion modes"
 assert "fileprivate func controller(at" in reader, "Page controller access level is invalid"
+assert "context.textMatrix = .identity" in reader, "Core Text pages must not render mirrored"
 imports = (root / "App/ImportCenter.swift").read_text()
 for feature in ["PhotosPicker", "PDFDocument", "TextRecognition", "NSAttributedString", "TextFileDecoder"]:
     assert feature in imports, feature
@@ -101,6 +102,6 @@ assert "var mamReduceMotion: Bool" in motion
 assert ".environment(\n          \\.accessibilityReduceMotion" not in app_root, "System Reduce Motion is read-only"
 project_spec = (root / "project.yml").read_text()
 assert "MARKETING_VERSION: 2.1.0" in project_spec
-assert "CURRENT_PROJECT_VERSION: '6'" in project_spec
+assert "CURRENT_PROJECT_VERSION: '7'" in project_spec
 print("PASS: v2 permissions, Managed entitlements, ambient audio and localization resources")
 print("PASS: v2.1 import center, book reader/page curl, ten fonts and interaction feedback")

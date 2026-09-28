@@ -8,7 +8,7 @@
 - Thay `TabView` bằng tab host giữ sống từng navigation/scroll state, chuyển cảnh spring + crossfade và xử lý chạm tab liên tiếp.
 - Thêm bốn âm thanh nguyên bản cho chạm/chọn/lật trang/hoàn thành, cường độ rung và cài đặt riêng; tôn trọng chế độ im lặng, nhạc đang phát và ghi âm.
 - Thêm mô hình dữ liệu tương thích backup cũ, kiểm tra bookmark/vị trí/sách mồ côi và 6 test reader/import; 57 test core đạt.
-- Tăng version lên 2.1.0 (build 6). Build 5 sửa access control của page curl và kết hợp Reduce Motion bằng environment key có thể ghi an toàn. Build 6 bỏ phụ thuộc vào các hằng Word/Office không đồng nhất giữa các iOS SDK; Foundation tự nhận dạng RTF, DOC, DOCX và HTML, còn file gốc vẫn được giữ nếu không trích được chữ. Native iOS build và device QA vẫn phải chạy trên macOS/Xcode.
+- Tăng version lên 2.1.0 (build 7). Build 5 sửa access control của page curl và kết hợp Reduce Motion bằng environment key có thể ghi an toàn. Build 6 bỏ phụ thuộc vào các hằng Word/Office không đồng nhất giữa các iOS SDK; Foundation tự nhận dạng RTF, DOC, DOCX và HTML, còn file gốc vẫn được giữ nếu không trích được chữ. Build 7 đặt lại Core Text text matrix trước khi lật hệ tọa độ, sửa lỗi chữ trong phòng đọc bị ngược/soi gương. Native iOS build và device QA vẫn phải chạy trên macOS/Xcode.
 
 # 2.0.0 — source update
 
