@@ -1,0 +1,57 @@
+name: Build MamStudy IPA
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: mamstudy-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    name: ${{ matrix.scheme }}
+    runs-on: macos-15
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        scheme: [MamStudy, MamStudyBasic, MamStudyManaged]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select Xcode 26
+        run: |
+          set -euo pipefail
+          XCODE_PATH=$(python3 scripts/select_xcode.py)
+          sudo xcode-select --switch "$XCODE_PATH/Contents/Developer"
+          xcodebuild -version
+      - name: Install XcodeGen
+        run: brew list xcodegen >/dev/null 2>&1 || brew install xcodegen
+      - name: Test core and build device app
+        run: bash scripts/build-ios.sh '${{ matrix.scheme }}'
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.scheme }}-unsigned-ipa
+          path: |
+            build/${{ matrix.scheme }}/*-unsigned.ipa
+            build/${{ matrix.scheme }}/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload readable logs even when build fails
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.scheme }}-build-logs
+          path: build/${{ matrix.scheme }}/logs/
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Show concise error summary
+        if: failure()
+        run: |
+          echo "### Build failure — download the build-logs artifact" >> "$GITHUB_STEP_SUMMARY"
+          if test -f 'build/${{ matrix.scheme }}/logs/xcodebuild.log'; then
+            grep -n -E 'error:|fatal error:|BUILD FAILED' 'build/${{ matrix.scheme }}/logs/xcodebuild.log' | head -50 >> "$GITHUB_STEP_SUMMARY" || true
+          fi

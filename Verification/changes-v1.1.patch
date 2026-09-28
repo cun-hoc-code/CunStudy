@@ -1,0 +1,1039 @@
+--- a/App/AppStore.swift
++++ b/App/AppStore.swift
+@@ -10,7 +10,9 @@
+     @Published private(set) var readOnly = false
+     @Published var tab = 0
+     @Published var reviewUndoAvailable = false
++    @Published var completedFocus: FocusSession?
+     let reminders = ReminderService()
++    let liveActivity = FocusActivityService()
+     private let disk: DiskStore
+     private var previousReview: ReviewUndo?
+ 
+@@ -35,6 +37,7 @@
+             state = next
+             publishSnapshot()
+             reminders.reconcile(state)
++            liveActivity.reconcile(state)
+             return true
+         } catch { errorMessage = "Chưa lưu được: \(error.localizedDescription)"; return false }
+     }
+@@ -44,15 +47,17 @@
+         settleFocus()
+         publishSnapshot()
+         reminders.reconcile(state)
++        liveActivity.reconcile(state)
+     }
+     func publishSnapshot() {
+         guard !readOnly else { widgetMessage = "Hãy khôi phục dữ liệu trước khi cập nhật widget."; return }
+         guard WidgetStorage.isEnabled else { widgetMessage = "Bản Basic không có widget. Cài bản đầy đủ để dùng tiện ích."; return }
+-        let today = StudyStats.daily(state.sessions, ending: Date(), days: 1).first?.minutes ?? 0
++        let progress = StudyProgress.summary(state, at: Date())
+         let value = WidgetSnapshot(updatedAt: Date(), lessons: state.lessons,
+             pendingTasks: state.tasks.filter { !$0.done }.count,
+             dueCards: ReviewEngine.queue(state, at: Date()).count,
+-            todayFocusMinutes: Int(today), goalMinutes: state.preferences.dailyFocusMinutes)
++            todayFocusMinutes: Int(progress.today.minutes), goalMinutes: state.preferences.dailyFocusMinutes,
++            currentStreak: progress.currentStreak, lastStudyDay: progress.days.last(where: \.qualifies)?.date)
+         do { try WidgetStorage.save(value); WidgetCenter.shared.reloadAllTimelines(); widgetMessage = "Đã gửi dữ liệu mới tới widget." }
+         catch { widgetMessage = error.localizedDescription }
+     }
+@@ -61,16 +66,21 @@
+     func saveNote(_ value: QuickNote) -> Bool { change { upsert(value, in: &$0.notes) } }
+     func saveCard(_ value: Flashcard) -> Bool { change { upsert(value, in: &$0.cards) } }
+     func toggleTask(_ id: UUID) {
+-        _ = change { s in
++        let wasDone = state.tasks.first { $0.id == id }?.done == true
++        if change({ s in
+             guard let i = s.tasks.firstIndex(where: { $0.id == id }) else { return }
+             s.tasks[i].done.toggle(); s.tasks[i].completedAt = s.tasks[i].done ? Date() : nil
+-        }
++        }) { if !wasDone { StudyHaptics.success(enabled: state.preferences.haptics) } }
+     }
+     func startFocus(subject: String, minutes: Int) {
+-        guard state.activeFocus == nil else { return }
++        guard state.activeFocus == nil, (1...120).contains(minutes) else { return }
+         let now = Date()
+-        _ = change { $0.activeFocus = ActiveFocus(subject: subject.trimmed.isEmpty ? "Tự học" : subject.trimmed,
+-                plannedSeconds: Double(minutes * 60), startedAt: now, runningSince: now) }
++        if change({ $0.activeFocus = ActiveFocus(subject: subject.trimmed.isEmpty ? "Tự học" : subject.trimmed,
++                plannedSeconds: Double(minutes * 60), startedAt: now, runningSince: now) }) {
++            completedFocus = nil
++            reminders.cancelBreak()
++            StudyHaptics.selection(enabled: state.preferences.haptics)
++        }
+     }
+     func pauseOrResume() {
+         settleFocus()
+@@ -81,24 +91,31 @@
+     }
+     func finishFocus(discard: Bool = false) {
+         guard let active = state.activeFocus else { return }
+-        _ = change { s in
+-            let session = active.finish(at: Date())
++        let session = active.finish(at: Date())
++        if change({ s in
+             if !discard && session.seconds >= 1 && !s.sessions.contains(where: { $0.id == session.id }) { s.sessions.append(session) }
+             s.activeFocus = nil
++        }) {
++            if !discard && session.completed {
++                completedFocus = session
++                StudyHaptics.success(enabled: state.preferences.haptics)
++            }
+         }
+     }
+     func settleFocus() {
+-        guard let active = state.activeFocus, let end = active.endDate, end <= Date() else { return }
++        guard !readOnly, let active = state.activeFocus, let end = active.endDate, end <= Date() else { return }
+         finishFocus()
+     }
+     @discardableResult
+     func review(_ card: Flashcard, rating: RecallRating) -> Bool {
+         guard let current = state.cards.first(where: { $0.id == card.id }), current == card else { return false }
+         let now = Date()
+-        let log = ReviewLog(cardID: card.id, date: now, rating: rating, wasNew: current.isNew)
+         let graded = ReviewEngine.graded(current, rating: rating, at: now)
++        let log = ReviewLog(cardID: card.id, date: now, rating: rating, wasNew: current.isNew,
++                            deck: current.deck, question: String(current.question.prefix(500)), nextDue: graded.due)
+         if change({ s in upsert(graded, in: &s.cards); s.reviews.append(log) }) {
+             previousReview = ReviewUndo(before: current, after: graded, logID: log.id); reviewUndoAvailable = true
++            StudyHaptics.selection(enabled: state.preferences.haptics)
+             return true
+         }
+         return false
+@@ -135,7 +152,7 @@
+                 try Data(contentsOf: disk.file).write(to: disk.beforeRestore, options: .atomic)
+             }
+             try StateCodec.encode(value).write(to: disk.file, options: .atomic)
+-            state = value; readOnly = false; clearReviewUndo()
++            state = value; readOnly = false; completedFocus = nil; clearReviewUndo()
+             refresh()
+         } catch { errorMessage = "Chưa khôi phục: \(error.localizedDescription)" }
+     }
+--- a/App/CardsView.swift
++++ b/App/CardsView.swift
+@@ -47,6 +47,9 @@
+                     if !reviews.isEmpty {
+                         Text("Hôm nay: \(reviews.count) lượt ôn • \(reviews.filter { $0.rating != .again }.count) lượt tự đánh giá đã nhớ").font(.caption)
+                     }
++                    NavigationLink { ReviewHistoryView() } label: {
++                        Label("Xem lịch sử ôn tập", systemImage: "clock.arrow.circlepath")
++                    }.buttonStyle(PencilButtonStyle(color: .sky))
+                     let cards = store.state.cards.filter {
+                         (deck == nil || $0.deck == deck) && (search.isEmpty || "\($0.front) \($0.back) \($0.deck)".localizedCaseInsensitiveContains(search))
+                     }.sorted { $0.createdAt > $1.createdAt }
+@@ -96,34 +99,47 @@
+ 
+ private struct ReviewSessionView: View {
+     @EnvironmentObject private var store: AppStore
++    @Environment(\.accessibilityReduceMotion) private var reduceMotion
++    @FocusState private var typing: Bool
+     @StateObject private var speech = CardSpeech()
+     let deck: String?
+     @State private var revealed = false
+     @State private var typed = ""
+     @State private var completed = 0
+     @State private var currentCardID: UUID?
++    @State private var hasStarted = false
+     var body: some View {
+         TimelineView(.periodic(from: .now, by: 10)) { context in
+             PaperPage {
+                 if let card = store.state.cards.first(where: { $0.id == currentCardID && !$0.suspended }) {
+                     HStack { Chip(text: card.deck, color: .lavender); Spacer(); Text("Đã ôn \(completed)").font(.caption) }
+-                    PaperCard(color: .butter) {
++                    ZStack {
++                        PaperCard(color: .butter) {
+                         VStack(alignment: .leading, spacing: 18) {
+                             Text(card.kind.title.uppercased()).font(.caption.bold())
+                             Text(card.question).font(.system(.title2, design: .rounded, weight: .semibold)).textSelection(.enabled)
+                             if card.kind == .vocabulary {
+                                 Button { speech.say(card.front, language: card.language) } label: { Label("Nghe phát âm", systemImage: "speaker.wave.2") }.font(.subheadline)
+                             }
+-                            if !revealed {
+-                                TextField("Thử gõ đáp án (không bắt buộc)", text: $typed, axis: .vertical).lineLimit(2...4)
+-                                    .textInputAutocapitalization(.never).autocorrectionDisabled()
+-                            } else {
+-                                Divider()
++                            TextField("Thử gõ đáp án (không bắt buộc)", text: $typed, axis: .vertical).lineLimit(2...4)
++                                .textInputAutocapitalization(.never).autocorrectionDisabled().focused($typing)
++                        }.frame(maxWidth: .infinity, minHeight: 220, alignment: .topLeading)
++                        }
++                        .modifier(FlashcardFace(angle: revealed ? 180 : 0))
++                        .accessibilityHidden(revealed).allowsHitTesting(!revealed)
++                        PaperCard(color: .sage) {
++                            VStack(alignment: .leading, spacing: 18) {
++                                Label("ĐÁP ÁN", systemImage: "sparkle").font(.caption.bold())
+                                 Text(card.answer).font(.title3).textSelection(.enabled)
+                                 if !card.example.isEmpty { Text(card.example).font(.body).foregroundStyle(.secondary) }
+                                 if !typed.trimmed.isEmpty { Text("Bạn đã trả lời: \(typed)").font(.footnote).foregroundStyle(.secondary) }
+-                            }
+-                        }
++                                if card.kind == .vocabulary {
++                                    Button { speech.say(card.front, language: card.language) } label: { Label("Nghe lại phát âm", systemImage: "speaker.wave.2") }.font(.subheadline)
++                                }
++                            }.frame(maxWidth: .infinity, minHeight: 220, alignment: .topLeading)
++                        }
++                        .modifier(FlashcardFace(angle: revealed ? 0 : -180))
++                        .accessibilityHidden(!revealed).allowsHitTesting(revealed)
+                     }
+                     if revealed {
+                         Text("Bạn nhớ đến mức nào?").font(.headline)
+@@ -141,11 +157,19 @@
+                         }
+                         Text("Quên = chưa nhớ. Khó = nhớ đúng nhưng chậm. Nhớ = trả lời đúng. Dễ = nhớ ngay.").font(.caption).foregroundStyle(.secondary)
+                     } else {
+-                        Button("Lật thẻ xem đáp án") { revealed = true }.buttonStyle(PencilButtonStyle())
++                        Button("Lật thẻ xem đáp án") {
++                            typing = false
++                            StudyHaptics.flip(enabled: store.state.preferences.haptics)
++                            withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.42)) { revealed = true }
++                        }.buttonStyle(PencilButtonStyle())
+                         Text("Thử nhớ lại bằng lời của mình trước khi xem.").font(.footnote).foregroundStyle(.secondary)
+                     }
+                 } else {
+                     Sprout()
++                    if completed > 0 {
++                        Text("Bạn vừa ôn \(completed) lượt. Thêm một chút kiến thức cho hôm nay!")
++                            .font(.system(.title3, design: .rounded, weight: .semibold)).multilineTextAlignment(.center)
++                    }
+                     EmptyPageCard(symbol: "checkmark.seal", title: "Đã ôn hết thẻ sẵn sàng", detail: "Bạn có thể nghỉ. Những thẻ đang học sẽ trở lại khi đến hạn; không cần ép mình ôn thêm liên tục.")
+                     if let next = store.state.cards.filter({ !$0.suspended && !$0.isNew && $0.due > context.date && (deck == nil || $0.deck == deck) }).min(by: { $0.due < $1.due }) {
+                         Text("Lượt tiếp theo: \(next.due.formatted(.dateTime.day().month().hour().minute()))").font(.footnote)
+@@ -166,11 +190,18 @@
+             }
+         }
+         .navigationTitle("Một thẻ, một ý").navigationBarTitleDisplayMode(.inline)
+-        .onAppear { store.clearReviewUndo(); showNextCard() }
++        .onAppear {
++            if !hasStarted { store.clearReviewUndo(); showNextCard(); hasStarted = true }
++        }
+         .onDisappear { speech.stop() }
++        .onChange(of: currentCardID) { old, new in
++            if old != nil && new == nil && completed > 0 { StudyHaptics.success(enabled: store.state.preferences.haptics) }
++        }
+     }
+     private func showNextCard() {
+-        revealed = false; typed = ""; speech.stop()
++        var transaction = Transaction(); transaction.disablesAnimations = true
++        withTransaction(transaction) { revealed = false }
++        typed = ""; typing = false; speech.stop()
+         currentCardID = ReviewEngine.queue(store.state, deck: deck, at: Date()).first?.id
+     }
+ }
+--- a/App/Design.swift
++++ b/App/Design.swift
+@@ -1,22 +1,30 @@
+ import SwiftUI
++import UIKit
++
++extension AppAppearance {
++    var colorScheme: ColorScheme? {
++        switch self { case .system: return nil; case .light: return .light; case .dark: return .dark }
++    }
++}
+ 
+ extension InkColor {
+     var wash: Color {
+         switch self {
+-        case .sage: return Color(red: 0.80, green: 0.88, blue: 0.75)
+-        case .peach: return Color(red: 0.98, green: 0.82, blue: 0.66)
+-        case .lavender: return Color(red: 0.86, green: 0.82, blue: 0.94)
+-        case .sky: return Color(red: 0.77, green: 0.87, blue: 0.94)
+-        case .butter: return Color(red: 0.98, green: 0.93, blue: 0.68)
+-        case .rose: return Color(red: 0.96, green: 0.80, blue: 0.80)
++        case .sage: return .adaptive(0xCCE0BF, 0x304431)
++        case .peach: return .adaptive(0xFAD1A8, 0x503B2E)
++        case .lavender: return .adaptive(0xDBD1F0, 0x41394F)
++        case .sky: return .adaptive(0xC4DEF0, 0x2E424F)
++        case .butter: return .adaptive(0xFAEDAD, 0x49432B)
++        case .rose: return .adaptive(0xF5CCCC, 0x503437)
+         }
+     }
+ }
+ 
+ enum Pencil {
+-    static let ink = Color(red: 0.21, green: 0.25, blue: 0.20)
+-    static let paper = Color(red: 0.985, green: 0.974, blue: 0.944)
+-    static let green = Color(red: 0.26, green: 0.39, blue: 0.24)
++    static let ink = Color.adaptive(0x354033, 0xE4ECDE)
++    static let paper = Color.adaptive(0xFBF8F1, 0x141C18)
++    static let surface = Color.adaptive(0xFFFFFF, 0x202A23)
++    static let green = Color.adaptive(0x42643D, 0xA7CF8D)
+     static let weekdays = [2, 3, 4, 5, 6, 7, 1]
+     static func weekday(_ value: Int) -> String { value == 1 ? "CN" : "T\(value)" }
+     static func time(_ minute: Int) -> String { String(format: "%02d:%02d", (minute / 60) % 24, minute % 60) }
+@@ -61,7 +69,7 @@
+     @ViewBuilder var content: () -> Content
+     var body: some View {
+         content().frame(maxWidth: .infinity, alignment: .leading).padding(17)
+-            .background(PencilOutline().fill(color?.wash ?? .white.opacity(0.88)))
++            .background(PencilOutline().fill(color?.wash ?? Pencil.surface.opacity(0.94)))
+             .overlay(PencilOutline().stroke(Pencil.ink.opacity(0.28), style: StrokeStyle(lineWidth: 1.3, lineCap: .round, lineJoin: .round)))
+     }
+ }
+@@ -77,13 +85,17 @@
+ }
+ 
+ struct PencilButtonStyle: ButtonStyle {
++    @Environment(\.accessibilityReduceMotion) private var reduceMotion
++    @Environment(\.isEnabled) private var isEnabled
+     var color: InkColor = .sage
+     func makeBody(configuration: Configuration) -> some View {
+         configuration.label.font(.system(.body, design: .rounded, weight: .semibold))
+             .foregroundStyle(Pencil.ink).padding(.horizontal, 17).padding(.vertical, 13)
+             .frame(maxWidth: .infinity).background(PencilOutline().fill(color.wash))
+             .overlay(PencilOutline().stroke(Pencil.ink.opacity(0.35), lineWidth: 1.2))
+-            .opacity(configuration.isPressed ? 0.7 : 1)
++            .opacity(isEnabled ? (configuration.isPressed ? 0.8 : 1) : 0.45)
++            .scaleEffect(configuration.isPressed && !reduceMotion ? 0.97 : 1)
++            .animation(reduceMotion ? nil : .spring(response: 0.28, dampingFraction: 0.75), value: configuration.isPressed)
+     }
+ }
+ 
+@@ -118,8 +130,9 @@
+     var body: some View { Text(text).font(.caption.weight(.medium)).padding(.horizontal, 9).padding(.vertical, 5).background(color.wash, in: Capsule()) }
+ }
+ 
+-struct Sprout: View {
++struct Sprout: View, Animatable {
+     var progress: Double = 1
++    var animatableData: Double { get { progress } set { progress = newValue } }
+     var body: some View {
+         Canvas { context, size in
+             let x = size.width / 2, bottom = size.height * 0.84
+--- a/App/FocusView.swift
++++ b/App/FocusView.swift
+@@ -1,9 +1,10 @@
+ import SwiftUI
+-import Charts
+ 
+ struct FocusView: View {
+     @EnvironmentObject private var store: AppStore
+     @EnvironmentObject private var reminders: ReminderService
++    @EnvironmentObject private var activity: FocusActivityService
++    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+     @State private var subject = ""
+     @State private var minutes = 25
+     @State private var stopping = false
+@@ -18,34 +19,41 @@
+                     if let active = store.state.activeFocus {
+                         activeContent(active, at: context.date)
+                     } else {
++                        if let completed = store.completedFocus {
++                            FocusCelebration(session: completed)
++                            Button("Đã nhận mầm mới") { store.completedFocus = nil }.font(.subheadline)
++                        }
+                         setupContent
+                     }
+-                    Button { showStats = true } label: { Label("Xem vườn & nhịp học", systemImage: "chart.bar.xaxis") }.buttonStyle(PencilButtonStyle(color: .butter))
+-                    Text("Đồng hồ tiếp tục khi bạn khóa máy hoặc rời app. Mầm không chặn các ứng dụng khác và không tự suy đoán bạn có đang chú ý hay không.").font(.caption).foregroundStyle(.secondary)
++                    Button { showStats = true } label: { Label("Vườn, streak & thống kê", systemImage: "chart.bar.xaxis") }.buttonStyle(PencilButtonStyle(color: .butter))
++                    Text("Thời gian nghỉ không được tính. Khóa máy hoặc rời app vẫn giữ đồng hồ của phiên học.").font(.caption).foregroundStyle(.secondary)
+                 }
+-                .onChange(of: context.date) { _, _ in store.settleFocus() }
+             }
+             .navigationTitle("Tập trung").navigationBarTitleDisplayMode(.inline)
+             .onAppear { minutes = store.state.preferences.focusMinutes }
+-            .sheet(isPresented: $showStats) { FocusStatsView() }
++            .sheet(isPresented: $showStats) { ProgressDashboard() }
+             .confirmationDialog("Kết thúc phiên này?", isPresented: $stopping, titleVisibility: .visible) {
+                 Button("Lưu thời gian đã học") { store.finishFocus() }
+                 Button("Bỏ phiên này", role: .destructive) { store.finishFocus(discard: true) }
+             }
+-            .alert("Đã bắt đầu giờ nghỉ", isPresented: $breakMessage) {
+-                Button("Được") {}
+-            } message: { Text("Bạn sẽ nhận thông báo sau \(store.state.preferences.breakMinutes) phút nếu đã cấp quyền thông báo.") }
++            .alert("Đã bắt đầu giờ nghỉ", isPresented: $breakMessage) { Button("Được") {} }
++                message: { Text("Bạn sẽ nhận thông báo sau \(store.state.preferences.breakMinutes) phút. Thả lỏng vai và nhìn ra xa một chút nhé.") }
+         }
+     }
+     private var setupContent: some View {
+         VStack(spacing: 18) {
+-            Sprout(progress: 0.25)
++            if store.completedFocus == nil { Sprout(progress: 0.25) }
+             PaperCard {
+                 VStack(alignment: .leading, spacing: 14) {
++                    Text("Mầm tiếp theo của bạn").font(.headline)
+                     TextField("Môn học hoặc mục tiêu phiên này", text: $subject).textInputAutocapitalization(.sentences)
+                     HStack {
+                         ForEach([25, 45, 60], id: \.self) { n in
+-                            Button("\(n) phút") { minutes = n }.buttonStyle(PencilButtonStyle(color: minutes == n ? .sage : .sky))
++                            Button("\(n) phút") {
++                                minutes = n
++                                StudyHaptics.selection(enabled: store.state.preferences.haptics)
++                            }.buttonStyle(PencilButtonStyle(color: minutes == n ? .sage : .sky))
++                                .accessibilityAddTraits(minutes == n ? .isSelected : [])
+                         }
+                     }
+                     Stepper("Tùy chỉnh: \(minutes) phút", value: $minutes, in: 5...120, step: 5)
+@@ -61,77 +69,76 @@
+         }
+     }
+     private func activeContent(_ active: ActiveFocus, at now: Date) -> some View {
+-        let left = max(0, Int(ceil(active.plannedSeconds - active.elapsed(at: now))))
++        let elapsed = active.elapsed(at: now)
++        let progress = elapsed / active.plannedSeconds
++        let left = max(0, Int(ceil(active.plannedSeconds - elapsed)))
+         return VStack(spacing: 18) {
+-            Sprout(progress: active.elapsed(at: now) / active.plannedSeconds)
+-            Text(String(format: "%02d:%02d", left / 60, left % 60))
+-                .font(.system(size: 60, weight: .light, design: .rounded)).monospacedDigit()
+-                .accessibilityLabel("Còn \(left / 60) phút \(left % 60) giây")
+-            Text(active.subject).font(.headline)
+-            Text(active.isPaused ? "Đang tạm dừng • thời gian nghỉ không được tính" : "Mầm đang lớn cùng bạn").font(.subheadline).foregroundStyle(.secondary)
+-            ProgressView(value: active.elapsed(at: now), total: active.plannedSeconds).tint(Pencil.green)
++            PaperCard {
++                VStack(spacing: 14) {
++                    HStack {
++                        Chip(text: active.isPaused ? "Tạm dừng" : "Đang vun trồng", color: active.isPaused ? .butter : .sage)
++                        Spacer()
++                        Text("\(Int(active.plannedSeconds / 60)) phút").font(.caption).foregroundStyle(.secondary)
++                    }
++                    ZStack {
++                        Circle().stroke(Pencil.green.opacity(0.12), lineWidth: 7)
++                        Circle().trim(from: 0, to: progress)
++                            .stroke(Pencil.green, style: StrokeStyle(lineWidth: 7, lineCap: .round))
++                            .rotationEffect(.degrees(-90))
++                            .animation(reduceMotion ? nil : .linear(duration: 0.8), value: progress)
++                        Sprout(progress: progress)
++                            .animation(reduceMotion ? nil : .easeInOut(duration: 0.8), value: progress)
++                    }.frame(width: 205, height: 205).padding(.vertical, 8).accessibilityHidden(true)
++                    Text(String(format: "%02d:%02d", left / 60, left % 60))
++                        .font(.system(size: 60, weight: .light, design: .rounded)).monospacedDigit()
++                        .minimumScaleFactor(0.65).lineLimit(1)
++                        .accessibilityLabel("Còn \(left / 60) phút \(left % 60) giây")
++                    Text(active.subject).font(.headline).multilineTextAlignment(.center)
++                    Text(active.isPaused ? "Mầm chờ bạn. Cứ nghỉ một chút." : "Mỗi phút là một chút lớn lên.")
++                        .font(.subheadline).foregroundStyle(.secondary)
++                }
++            }
+             HStack {
+-                Button(active.isPaused ? "Tiếp tục" : "Tạm dừng") { store.pauseOrResume() }.buttonStyle(PencilButtonStyle())
++                Button(active.isPaused ? "Tiếp tục" : "Tạm dừng") {
++                    store.pauseOrResume()
++                    StudyHaptics.selection(enabled: store.state.preferences.haptics)
++                }.buttonStyle(PencilButtonStyle())
+                 Button("Kết thúc") { stopping = true }.buttonStyle(PencilButtonStyle(color: .peach))
++            }
++            if store.state.preferences.liveActivities {
++                Label(activity.message, systemImage: "lock.iphone").font(.caption).foregroundStyle(.secondary)
+             }
+         }
+     }
+ }
+ 
+-private struct FocusStatsView: View {
++private struct FocusCelebration: View {
+     @EnvironmentObject private var store: AppStore
+-    @Environment(\.dismiss) private var dismiss
+-    @State private var range = 7
++    @Environment(\.accessibilityReduceMotion) private var reduceMotion
++    @State private var arrived = false
++    let session: FocusSession
+     var body: some View {
+-        NavigationStack {
+-            PaperPage {
+-                Picker("Thời gian", selection: $range) { Text("7 ngày").tag(7); Text("30 ngày").tag(30) }.pickerStyle(.segmented)
+-                let days = StudyStats.daily(store.state.sessions, ending: Date(), days: range)
+-                let sum = days.reduce(0) { $0 + $1.minutes }
+-                PaperCard(color: .sage) {
+-                    VStack(alignment: .leading, spacing: 8) {
+-                        Text(Pencil.duration(sum)).font(.system(.largeTitle, design: .rounded, weight: .bold))
+-                        Text("trong \(range) ngày • \(days.filter { $0.minutes > 0 }.count) ngày có học").font(.subheadline)
++        let progress = StudyProgress.summary(store.state, at: Date())
++        PaperCard(color: .sage) {
++            VStack(spacing: 12) {
++                ZStack {
++                    Sprout()
++                    ForEach(0..<6, id: \.self) { index in
++                        Image(systemName: index.isMultiple(of: 2) ? "sparkle" : "leaf.fill")
++                            .font(index.isMultiple(of: 2) ? .body : .caption)
++                            .foregroundStyle(Pencil.green.opacity(0.65))
++                            .offset(x: CGFloat(index.isMultiple(of: 2) ? -1 : 1) * (65 + CGFloat(index % 3) * 15),
++                                    y: CGFloat(index / 2) * 42 - 55)
++                            .scaleEffect(arrived || reduceMotion ? 1 : 0.1)
++                            .opacity(arrived || reduceMotion ? 1 : 0)
+                     }
+                 }
+-                PaperCard {
+-                    Chart {
+-                        ForEach(Array(days.enumerated()), id: \.offset) { pair in
+-                            BarMark(x: .value("Ngày", pair.element.date, unit: .day), y: .value("Phút", pair.element.minutes))
+-                                .foregroundStyle(Pencil.green.gradient).cornerRadius(4)
+-                        }
+-                        RuleMark(y: .value("Mục tiêu", store.state.preferences.dailyFocusMinutes))
+-                            .foregroundStyle(.orange.opacity(0.5)).lineStyle(StrokeStyle(dash: [4]))
+-                    }.frame(height: 190).chartYAxisLabel("phút")
+-                }
+-                PaperCard(color: .butter) { Text(StudyStats.insight(store.state.sessions, at: Date())).font(.subheadline) }
+-                SectionTitle(title: "Mỗi phiên xong, một mầm", caption: "\(store.state.sessions.filter(\.completed).count) phiên hoàn thành từ trước đến nay")
+-                LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 7), spacing: 14) {
+-                    ForEach(store.state.sessions.filter(\.completed).suffix(35)) { session in
+-                        Image(systemName: "leaf.fill").font(.title2).foregroundStyle(Pencil.green.opacity(0.75))
+-                            .accessibilityLabel("\(session.subject), \(Int(session.seconds / 60)) phút")
+-                    }
+-                }
+-                SectionTitle(title: "Theo môn trong \(range) ngày")
+-                let subjects = Set(store.state.sessions.map(\.subject)).sorted()
+-                ForEach(subjects, id: \.self) { subject in
+-                    let seconds = StudyStats.seconds(store.state.sessions.filter { $0.subject == subject },
+-                        from: days.first?.date ?? Date(), to: Date())
+-                    if seconds > 0 {
+-                        HStack { Text(subject); Spacer(); Text(Pencil.duration(seconds / 60)).foregroundStyle(.secondary) }.font(.subheadline)
+-                    }
+-                }
+-                SectionTitle(title: "Các phiên gần đây")
+-                ForEach(store.state.sessions.sorted { $0.finishedAt > $1.finishedAt }.prefix(12)) { session in
+-                    HStack {
+-                        VStack(alignment: .leading) { Text(session.subject); Text(session.finishedAt, format: .dateTime.day().month().hour().minute()).font(.caption).foregroundStyle(.secondary) }
+-                        Spacer(); Text(Pencil.duration(session.seconds / 60)).font(.subheadline)
+-                        Image(systemName: session.completed ? "checkmark.seal" : "circle.lefthalf.filled").foregroundStyle(Pencil.green)
+-                    }
+-                }
+-            }
+-            .navigationTitle("Vườn & nhịp học").navigationBarTitleDisplayMode(.inline)
+-            .toolbar { Button("Xong") { dismiss() } }
++                Text("Một mầm mới trong vườn!").font(.system(.title2, design: .rounded, weight: .bold)).multilineTextAlignment(.center)
++                Text("Bạn đã dành \(Int(session.seconds / 60)) phút cho \(session.subject).").font(.subheadline).multilineTextAlignment(.center)
++                Label("\(progress.currentStreak) ngày giữ nhịp • Cấp \(progress.level)", systemImage: "flame.fill").font(.subheadline.bold())
++                Text("Lưu xong rồi. Đến lúc nghỉ một chút.").font(.caption).foregroundStyle(.secondary)
++            }.frame(maxWidth: .infinity)
+         }
++        .onAppear { withAnimation(reduceMotion ? nil : .spring(response: 0.65, dampingFraction: 0.65)) { arrived = true } }
+     }
+ }
+--- a/App/MamStudyApp.swift
++++ b/App/MamStudyApp.swift
+@@ -1,6 +1,7 @@
+ import SwiftUI
+ import UserNotifications
+ import UIKit
++import Combine
+ 
+ final class ForegroundNotifications: NSObject, UNUserNotificationCenterDelegate {
+     func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
+@@ -18,10 +19,12 @@
+     var body: some Scene {
+         WindowGroup {
+             RootView().environmentObject(store).environmentObject(store.reminders)
++                .environmentObject(store.liveActivity)
+                 .tint(Pencil.green).foregroundStyle(Pencil.ink)
+-                .preferredColorScheme(.light)
++                .preferredColorScheme(store.state.preferences.appearance.colorScheme)
+                 .environment(\.locale, Locale(identifier: "vi_VN"))
+                 .onChange(of: scenePhase) { _, phase in if phase == .active { store.refresh() } }
++                .task { store.refresh() }
+                 .onReceive(NotificationCenter.default.publisher(for: UIApplication.significantTimeChangeNotification)) { _ in store.refresh() }
+                 .onOpenURL { url in
+                     guard url.scheme == "mamstudy" else { return }
+@@ -38,15 +41,31 @@
+     @EnvironmentObject private var store: AppStore
+     var body: some View {
+         TabView(selection: $store.tab) {
+-            TodayView().tabItem { Label("Hôm nay", systemImage: "sun.max") }.tag(0)
+-            PlannerView().tabItem { Label("Kế hoạch", systemImage: "calendar") }.tag(1)
+-            FocusView().tabItem { Label("Tập trung", systemImage: "leaf") }.tag(2)
+-            CardsView().tabItem { Label("Ôn thẻ", systemImage: "rectangle.on.rectangle") }.tag(3)
+-            NotebookView().tabItem { Label("Sổ tay", systemImage: "pencil.and.scribble") }.tag(4)
++            TodayView().modifier(TabArrival()).tabItem { Label("Hôm nay", systemImage: "sun.max") }.tag(0)
++            PlannerView().modifier(TabArrival()).tabItem { Label("Kế hoạch", systemImage: "calendar") }.tag(1)
++            FocusView().modifier(TabArrival()).tabItem { Label("Tập trung", systemImage: "leaf") }.tag(2)
++            CardsView().modifier(TabArrival()).tabItem { Label("Ôn thẻ", systemImage: "rectangle.on.rectangle") }.tag(3)
++            NotebookView().modifier(TabArrival()).tabItem { Label("Sổ tay", systemImage: "pencil.and.scribble") }.tag(4)
++        }
++        .onChange(of: store.tab) { _, _ in StudyHaptics.selection(enabled: store.state.preferences.haptics) }
++        .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { _ in
++            // Any tab can be visible when a focus session ends. Disk is written only once.
++            if store.state.activeFocus != nil && !store.readOnly { store.settleFocus() }
+         }
+         .fullScreenCover(isPresented: Binding(get: { !store.state.preferences.hasOnboarded && !store.readOnly }, set: { _ in })) {
+             WelcomeView()
+         }
++    }
++}
++
++private struct TabArrival: ViewModifier {
++    @Environment(\.accessibilityReduceMotion) private var reduceMotion
++    @State private var visible = false
++    func body(content: Content) -> some View {
++        content.opacity(visible || reduceMotion ? 1 : 0)
++            .offset(y: visible || reduceMotion ? 0 : 8)
++            .onAppear { withAnimation(reduceMotion ? nil : .easeOut(duration: 0.22)) { visible = true } }
++            .onDisappear { visible = false }
+     }
+ }
+ 
+--- a/App/PlannerView.swift
++++ b/App/PlannerView.swift
+@@ -64,7 +64,7 @@
+                             Text(Pencil.weekday(calendar.component(.weekday, from: date))).font(.caption)
+                             Text("\(calendar.component(.day, from: date))").font(.body.bold())
+                         }.frame(maxWidth: .infinity).padding(.vertical, 12)
+-                            .background(selected ? InkColor.sage.wash : Color.white.opacity(0.6), in: RoundedRectangle(cornerRadius: 12))
++                            .background(selected ? InkColor.sage.wash : Pencil.surface.opacity(0.6), in: RoundedRectangle(cornerRadius: 12))
+                     }.buttonStyle(.plain)
+                 }
+             }
+--- a/App/ReminderService.swift
++++ b/App/ReminderService.swift
+@@ -203,4 +203,5 @@
+             return true
+         } catch { problems = [error.localizedDescription]; return false }
+     }
++    func cancelBreak() { center.removePendingNotificationRequests(withIdentifiers: ["mam-break"]) }
+ }
+--- a/App/SettingsView.swift
++++ b/App/SettingsView.swift
+@@ -5,6 +5,7 @@
+ struct SettingsView: View {
+     @EnvironmentObject private var store: AppStore
+     @EnvironmentObject private var reminders: ReminderService
++    @EnvironmentObject private var activity: FocusActivityService
+     @Environment(\.dismiss) private var dismiss
+     @State private var preferences = Preferences()
+     @State private var shareURL: URL?
+@@ -17,16 +18,42 @@
+     var body: some View {
+         NavigationStack {
+             Form {
++                Section("Giao diện & cảm giác") {
++                    Picker("Chế độ hiển thị", selection: Binding(
++                        get: { store.state.preferences.appearance },
++                        set: { new in
++                            if store.change({ $0.preferences.appearance = new }) { preferences.appearance = new }
++                        })) { ForEach(AppAppearance.allCases) { Text($0.title).tag($0) } }
++                    Toggle("Rung nhẹ khi tương tác", isOn: Binding(
++                        get: { store.state.preferences.haptics },
++                        set: { new in
++                            if store.change({ $0.preferences.haptics = new }) { preferences.haptics = new }
++                            StudyHaptics.selection(enabled: new)
++                        }))
++                    Text("Rung khi lật thẻ, đổi tab, chấm thẻ và hoàn thành phiên. Hiệu ứng tự giảm khi bật Giảm chuyển động trên iPhone.").font(.footnote).foregroundStyle(.secondary)
++                }
+                 Section("Nhịp học của mình") {
+                     TextField("Tên gọi", text: $preferences.name)
+                     Stepper("Tập trung: \(preferences.dailyFocusMinutes) phút / ngày", value: $preferences.dailyFocusMinutes, in: 15...240, step: 15)
+                     Stepper("Phiên mặc định: \(preferences.focusMinutes) phút", value: $preferences.focusMinutes, in: 5...120, step: 5)
+                     Stepper("Giờ nghỉ: \(preferences.breakMinutes) phút", value: $preferences.breakMinutes, in: 1...30)
+                     Stepper("Thẻ mới: \(preferences.newCardsPerDay) / ngày", value: $preferences.newCardsPerDay, in: 1...100)
++                    Stepper("Mục tiêu ôn: \(preferences.dailyReviewGoal) thẻ / ngày", value: $preferences.dailyReviewGoal, in: 1...100)
+                     Button("Lưu thiết lập") {
+                         preferences.name = preferences.name.trimmed.isEmpty ? "Bạn" : preferences.name.trimmed
+                         if store.change({ $0.preferences = preferences }) { message = "Đã lưu thiết lập." }
+                     }
++                }
++                Section {
++                    Toggle("Mầm trên màn hình khóa", isOn: Binding(
++                        get: { store.state.preferences.liveActivities },
++                        set: { new in
++                            if store.change({ $0.preferences.liveActivities = new }) { preferences.liveActivities = new }
++                        })).disabled(!WidgetStorage.isEnabled)
++                    Text(activity.message).font(.subheadline)
++                    Text("Bắt đầu một phiên Tập trung để xem thời gian còn lại và mầm. Chạm vào hoạt động để trở lại phiên học.").font(.footnote)
++                } header: { Text("Hoạt động trực tiếp") } footer: {
++                    Text("Cần bản đầy đủ có extension. Dynamic Island hiển thị trên máy hỗ trợ. Khi phiên kết thúc ở nền, đồng hồ về 0; mở app để lưu phiên và đóng hoạt động.")
+                 }
+                 Section {
+                     LabeledContent("Báo thức", value: reminders.alarmPermission)
+@@ -65,10 +92,10 @@
+                     Text("Lưu file sao lưu vào ứng dụng Tệp hoặc iCloud Drive tùy bạn chọn. Mầm chưa có đồng bộ iCloud tự động. App mới có dữ liệu độc lập với StudyFlow cũ.")
+                 }
+                 Section("Về Mầm") {
+-                    Text("Phiên bản 1.0 • Sổ học tập cá nhân")
++                    Text("Phiên bản 1.1 • Mỗi ngày, lớn thêm một chút")
+                     Text("Không quảng cáo, không tài khoản, không dịch vụ phân tích gửi ra ngoài.").font(.footnote)
+                     Text("Ôn tập dùng thuật toán giãn cách lấy cảm hứng từ SM-2 với bước học ngắn. Không phải FSRS của Anki và không có bảo đảm nhớ nhanh hơn cho mọi người.").font(.footnote)
+-                    Text("Giao diện nền giấy sáng được chọn để giữ độ tương phản của bảng màu bút chì.").font(.footnote)
++                    Text("Streak: mỗi ngày có ít nhất 5 phút tập trung đã lưu hoặc ôn 5 thẻ khác nhau. Không mất chuỗi khi hôm nay vẫn chưa kết thúc.").font(.footnote)
+                 }
+             }
+             .navigationTitle("Cài đặt").navigationBarTitleDisplayMode(.inline)
+--- a/App/TodayView.swift
++++ b/App/TodayView.swift
+@@ -4,6 +4,7 @@
+     @EnvironmentObject private var store: AppStore
+     @EnvironmentObject private var reminders: ReminderService
+     @State private var settings = false
++    @State private var progress = false
+     @State private var lesson: Lesson?
+     @State private var task: StudyTask?
+     @State private var note: QuickNote?
+@@ -26,6 +27,7 @@
+                 }
+             }
+             .sheet(isPresented: $settings) { SettingsView() }
++            .sheet(isPresented: $progress) { ProgressDashboard() }
+             .sheet(item: $lesson) { LessonEditor(value: $0) }
+             .sheet(item: $task) { TaskEditor(value: $0) }
+             .sheet(item: $note) { NoteEditor(value: $0) }
+@@ -36,11 +38,29 @@
+         let pending = store.state.tasks.filter { !$0.done }.sorted { ($0.due ?? .distantFuture) < ($1.due ?? .distantFuture) }
+         let focus = StudyStats.daily(store.state.sessions, ending: now, days: 1).first?.minutes ?? 0
+         let due = ReviewEngine.queue(store.state, at: now).count
++        let summary = StudyProgress.summary(store.state, at: now)
+         return PaperPage {
+             VStack(alignment: .leading, spacing: 6) {
+                 Text(now.formatted(.dateTime.weekday(.wide).day().month(.wide))).font(.footnote).foregroundStyle(.secondary)
+                 Text("Chào \(store.state.preferences.name),").font(.system(.largeTitle, design: .rounded, weight: .bold))
+                 Text("Hôm nay mình học gì?").font(.title3)
++            }
++            StreakCard(summary: summary) { progress = true }
++            DailyMissions(summary: summary, preferences: store.state.preferences)
++            if let active = store.state.activeFocus {
++                Button { store.tab = 2 } label: {
++                    PaperCard(color: .sage) {
++                        HStack {
++                            Label(active.isPaused ? "Phiên đang tạm dừng" : "Mầm đang lớn", systemImage: "leaf.fill")
++                            Spacer()
++                            Image(systemName: "arrow.right")
++                        }.font(.subheadline.bold())
++                    }
++                }.buttonStyle(.plain)
++            } else if store.completedFocus != nil {
++                Button { store.tab = 2 } label: {
++                    PaperCard(color: .butter) { Label("Bạn có một mầm mới. Xem phiên vừa hoàn thành", systemImage: "checkmark.seal") }
++                }.buttonStyle(.plain)
+             }
+             if !reminders.problems.isEmpty {
+                 Button { settings = true } label: {
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,3 +1,18 @@
++# Mầm 1.1 — 17/09/2026
++
++- Thêm ActivityKit: thời gian, mầm, tiến độ, tạm dừng và mở lại phiên từ màn hình khóa/Dynamic Island.
++- Thêm streak hiện tại/dài nhất, mục tiêu ngày, XP/cấp độ, sáu huy hiệu và heatmap.
++- Thêm lịch sử ôn tìm/lọc, snapshot bộ thẻ/câu hỏi/lịch tiếp theo; phân trang danh sách.
++- Giữ thống kê theo môn và vườn; mở rộng biểu đồ 90 ngày/chọn ngày, nhật ký focus có tìm kiếm.
++- Thêm sáng/tối/theo hệ thống, bảng màu tối cho widget, chuyển tab nhẹ, lật thẻ 3D, haptic tùy chọn và Giảm chuyển động.
++- Xử lý hoàn thành phiên từ mọi tab, ghi một lần và có thẻ nhận mầm. Bắt đầu phiên mới hủy nhắc giờ nghỉ cũ.
++- Đọc JSON 1.0 với mặc định cho các tùy chọn mới; log cũ không bị bịa thêm nội dung.
++- Tăng version 1.1.0/build 2; bổ sung kiểm thử tiến độ và nâng cấp dữ liệu.
++
++Xem hướng dẫn tại `docs/UPGRADE-v1.1.md`, kết quả xác minh tại `Verification/STATUS.md`.
++
++---
++
+ # Tiếp tục từ project Mầm đang làm
+ 
+ ## Trạng thái lúc tiếp tục
+--- a/Config/App-Info.plist
++++ b/Config/App-Info.plist
+@@ -16,7 +16,7 @@
+   <key>StudyWidgetsEnabled</key><string>$(STUDY_WIDGETS_ENABLED)</string>
+   <key>UIApplicationSceneManifest</key><dict><key>UIApplicationSupportsMultipleScenes</key><false/></dict>
+   <key>UILaunchScreen</key><dict/>
+-  <key>UIUserInterfaceStyle</key><string>Light</string>
++  <key>NSSupportsLiveActivities</key><true/>
+   <key>UISupportedInterfaceOrientations</key><array><string>UIInterfaceOrientationPortrait</string><string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string></array>
+   <key>UISupportedInterfaceOrientations~ipad</key><array><string>UIInterfaceOrientationPortrait</string><string>UIInterfaceOrientationPortraitUpsideDown</string><string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string></array>
+   <key>CFBundleURLTypes</key><array><dict><key>CFBundleURLName</key><string>com.cunz.mamstudy</string><key>CFBundleURLSchemes</key><array><string>mamstudy</string></array></dict></array>
+--- a/Core/Models.swift
++++ b/Core/Models.swift
+@@ -200,6 +200,19 @@
+     var date: Date
+     var rating: RecallRating
+     var wasNew: Bool
++    // Preserve what was actually reviewed, even after a card is edited/deleted.
++    // Optional fields keep v1 backups readable.
++    var deck: String? = nil
++    var question: String? = nil
++    var nextDue: Date? = nil
++}
++
++enum AppAppearance: String, Codable, CaseIterable, Identifiable {
++    case system, light, dark
++    var id: String { rawValue }
++    var title: String {
++        switch self { case .system: return "Theo hệ thống"; case .light: return "Sáng"; case .dark: return "Tối" }
++    }
+ }
+ 
+ struct Preferences: Codable, Equatable {
+@@ -209,6 +222,29 @@
+     var focusMinutes = 25
+     var breakMinutes = 5
+     var hasOnboarded = false
++    var appearance: AppAppearance = .system
++    var haptics = true
++    var liveActivities = true
++    var dailyReviewGoal = 10
++
++    init() {}
++    enum CodingKeys: String, CodingKey {
++        case name, dailyFocusMinutes, newCardsPerDay, focusMinutes, breakMinutes, hasOnboarded
++        case appearance, haptics, liveActivities, dailyReviewGoal
++    }
++    init(from decoder: Decoder) throws {
++        let c = try decoder.container(keyedBy: CodingKeys.self)
++        name = try c.decodeIfPresent(String.self, forKey: .name) ?? "Bạn"
++        dailyFocusMinutes = try c.decodeIfPresent(Int.self, forKey: .dailyFocusMinutes) ?? 60
++        newCardsPerDay = try c.decodeIfPresent(Int.self, forKey: .newCardsPerDay) ?? 15
++        focusMinutes = try c.decodeIfPresent(Int.self, forKey: .focusMinutes) ?? 25
++        breakMinutes = try c.decodeIfPresent(Int.self, forKey: .breakMinutes) ?? 5
++        hasOnboarded = try c.decodeIfPresent(Bool.self, forKey: .hasOnboarded) ?? false
++        appearance = try c.decodeIfPresent(AppAppearance.self, forKey: .appearance) ?? .system
++        haptics = try c.decodeIfPresent(Bool.self, forKey: .haptics) ?? true
++        liveActivities = try c.decodeIfPresent(Bool.self, forKey: .liveActivities) ?? true
++        dailyReviewGoal = try c.decodeIfPresent(Int.self, forKey: .dailyReviewGoal) ?? 10
++    }
+ }
+ 
+ struct StudyState: Codable, Equatable {
+--- a/Core/Persistence.swift
++++ b/Core/Persistence.swift
+@@ -102,7 +102,8 @@
+             }
+         }
+         guard (1...240).contains(state.preferences.dailyFocusMinutes), (1...100).contains(state.preferences.newCardsPerDay),
+-              (1...120).contains(state.preferences.focusMinutes), (1...30).contains(state.preferences.breakMinutes) else {
++              (1...120).contains(state.preferences.focusMinutes), (1...30).contains(state.preferences.breakMinutes),
++              (1...100).contains(state.preferences.dailyReviewGoal) else {
+             throw StudyError.invalid("Thiết lập trong bản sao lưu không hợp lệ.")
+         }
+     }
+@@ -139,4 +140,6 @@
+     var dueCards: Int
+     var todayFocusMinutes: Int
+     var goalMinutes: Int
++    var currentStreak: Int? = nil
++    var lastStudyDay: Date? = nil
+ }
+--- a/HUONG-DAN.md
++++ b/HUONG-DAN.md
+@@ -1,4 +1,6 @@
+ # Tạo IPA của Mầm trên Arch / Windows
++
++**Đã có IPA 1.0?** Đọc [Cập nhật lên Mầm 1.1](docs/UPGRADE-v1.1.md): cập nhật repo hiện tại, build job `MamStudy` để có Live Activity. Các bước tạo repo dưới đây dành cho lần đầu.
+ 
+ File ZIP bạn tải là **mã nguồn**, nên nhỏ hơn app đã biên dịch. Chưa thể cài ZIP này lên iPhone. Đổi tên ZIP thành IPA cũng không tạo ra app.
+ 
+--- a/README.md
++++ b/README.md
+@@ -1,8 +1,14 @@
+ # Mầm 🌱
+ 
+-**Mỗi ngày, lớn thêm một chút.** Sổ học tập cá nhân bằng SwiftUI: lịch ở trường, lịch tự học, việc cần làm, tập trung, ôn thẻ và ghi chú. Giao diện nền giấy sáng, màu bút chì và nét viền vẽ tay.
++**Mỗi ngày, lớn thêm một chút.** Sổ học tập cá nhân bằng SwiftUI: lịch ở trường, lịch tự học, việc cần làm, tập trung, ôn thẻ và ghi chú. Giao diện nền giấy, màu bút chì và nét viền vẽ tay, có chế độ sáng/tối.
+ 
+ Đây là **project mã nguồn**, chưa phải file IPA đã biên dịch. Trạng thái kiểm tra thực tế nằm trong [Verification/STATUS.md](Verification/STATUS.md). Build iOS cần macOS + Xcode; workflow GitHub Actions đã được chuẩn bị để tạo IPA chưa ký. Không dùng lại mã nguồn StudyFlow cũ.
++
++## Bản 1.1 — tiếp tục từ IPA đã build
++
++Đã thêm Live Activity màn hình khóa/Dynamic Island, streak, XP/cấp độ, huy hiệu, mục tiêu ngày, lịch sử ôn có bộ lọc, biểu đồ 7/30/90 ngày và heatmap 84 ngày. Haptic và animation có thể dùng với dark mode. Xem **[hướng dẫn cập nhật 1.1](docs/UPGRADE-v1.1.md)** trước khi build lại.
++
++IPA 1.0 do bạn gửi đã được kiểm tra cấu trúc: ZIP hợp lệ, app và widget là executable ARM64 cho thiết bị iOS. **Bản 1.1 trong gói này chưa được build bằng Xcode hoặc chạy trên iPhone ở phiên làm việc này.**
+ 
+ ## Bắt đầu
+ 
+@@ -19,20 +25,23 @@
+ | Kế hoạch | Tách Ở trường / Tự học / Cá nhân; lịch tuần hoặc một lần; phòng học, giảng viên, ghi nhớ, màu môn học; cảnh báo trùng giờ. |
+ | Todo | Môn học, ưu tiên, deadline, nhắc hạn, checklist, hoàn thành, tìm kiếm và lọc. |
+ | Tập trung | Phiên 5–120 phút, mầm cây theo tiến độ, tạm dừng/tiếp tục, lưu phiên ngắn hoặc bỏ phiên; thông báo hết phiên và giờ nghỉ. |
+-| Phân tích | Tổng phút/giờ, biểu đồ 7/30 ngày, thống kê theo môn, so sánh hai tuần, các phiên gần đây và vườn mầm. |
++| Phân tích | Tổng phút/giờ, biểu đồ 7/30/90 ngày có chọn ngày, heatmap 84 ngày, thống kê theo môn, streak, XP/cấp độ, huy hiệu, nhật ký tập trung và vườn mầm. |
+ | Nhắc học | Báo thức AlarmKit trên iOS 26+; nhắc trước giờ học theo thời gian chuẩn bị + di chuyển; lịch lặp tuần. Có chế độ thông báo thường riêng. |
+ | Sổ tay | Ghi nhanh, sách cần mua, môn học, điều quan trọng; ghim, màu, tìm kiếm. |
+ | Ôn thẻ | Bộ thẻ, từ vựng, hỏi–đáp, điền khuyết `{{...}}`; nhớ trước khi lật; bốn mức tự chấm; lịch ôn giãn cách, giới hạn thẻ mới, hoàn tác, giọng đọc hệ thống. |
++| Lịch sử ôn | Lọc thời gian/bộ thẻ/mức nhớ, tìm nội dung, bản chụp câu hỏi khi chấm, lịch ôn tiếp theo; giữ log khi xóa thẻ. |
++| Giao diện | Sáng/tối/theo hệ thống, lật thẻ 3D, tab hiện nhẹ, rung có tùy chọn, tôn trọng Giảm chuyển động. |
+ | Nhập thẻ | TSV UTF-8 gồm câu hỏi, đáp án và ví dụ tùy chọn. Có file mẫu trong `Examples/`. Không nhập `.apkg`. |
+ | Widget | Lịch tiếp theo và Nhịp học; lịch hỗ trợ nhỏ/vừa/lớn và hình chữ nhật trên màn hình khóa. Chạm mở đúng mục trong app. |
++| Live Activity | Mầm, đồng hồ hệ thống, tiến độ, tạm dừng và trạng thái kết thúc trên màn hình khóa/Dynamic Island; bản đầy đủ. |
+ | Dữ liệu | JSON trên máy, ghi nguyên tử, bản lưu trước đó, xuất/nhập, lấy lại dữ liệu trước lần nhập gần nhất. Không tài khoản hoặc backend. |
+ 
+ ## Hai bản build
+ 
+ | Scheme | Đặc điểm | File đầu ra |
+ | --- | --- | --- |
+-| `MamStudy` | Đầy đủ tính năng, kèm widget và App Groups | `MamStudy-unsigned.ipa` |
+-| `MamStudyBasic` | Toàn bộ chức năng trong app, không kèm widget | `MamStudyBasic-unsigned.ipa` |
++| `MamStudy` | Đầy đủ, kèm widget, Live Activity và App Groups | `MamStudy-unsigned.ipa` |
++| `MamStudyBasic` | Chức năng trong app; không có widget/Live Activity | `MamStudyBasic-unsigned.ipa` |
+ 
+ Cả hai dùng bundle ID `com.cunz.mamstudy`, do đó cài thay nhau, không cài song song. Xuất bản sao lưu trước khi đổi cách ký hoặc gỡ app. Bản Basic không hiện thao tác kết nối widget.
+ 
+@@ -91,6 +100,7 @@
+ 
+ ## Tài liệu nền tảng
+ 
++- [Apple: Live Activities](https://developer.apple.com/documentation/activitykit/displaying-live-data-with-live-activities)
+ - [Apple: Meet AlarmKit](https://developer.apple.com/videos/play/wwdc2025/230/)
+ - [Apple: cập nhật widget](https://developer.apple.com/documentation/widgetkit/keeping-a-widget-up-to-date)
+ - [Apple: cấu hình App Groups](https://developer.apple.com/documentation/xcode/configuring-app-groups)
+--- a/Widget/MamWidgets.swift
++++ b/Widget/MamWidgets.swift
+@@ -29,7 +29,7 @@
+ struct ScheduleWidgetView: View {
+     @Environment(\.widgetFamily) private var family
+     let entry: StudyWidgetEntry
+-    private let ink = Color(red: 0.21, green: 0.25, blue: 0.20)
++    private let ink = Color.adaptive(0x354033, 0xE4ECDE)
+     var body: some View {
+         Group {
+             if let snapshot = entry.snapshot {
+@@ -69,7 +69,7 @@
+             }
+         }
+         .foregroundStyle(family == .accessoryRectangular ? Color.primary : ink)
+-        .containerBackground(for: .widget) { Color(red: 0.97, green: 0.96, blue: 0.90) }
++        .containerBackground(for: .widget) { Color.adaptive(0xF7F5E6, 0x202A23) }
+         .widgetURL(URL(string: "mamstudy://schedule"))
+     }
+ }
+@@ -77,20 +77,25 @@
+ struct RhythmWidgetView: View {
+     let entry: StudyWidgetEntry
+     var body: some View {
+-        VStack(alignment: .leading, spacing: 10) {
++        VStack(alignment: .leading, spacing: 7) {
+             Label("NHỊP HỌC", systemImage: "leaf").font(.caption.bold())
+             if let snapshot = entry.snapshot {
+                 let sameDay = Calendar.current.isDate(snapshot.updatedAt, inSameDayAs: entry.date)
+                 let focus = sameDay ? snapshot.todayFocusMinutes : 0
+-                Text("\(focus) phút").font(.system(.title, design: .rounded, weight: .bold))
++                Text("\(focus) phút").font(.system(.title2, design: .rounded, weight: .bold))
+                 ProgressView(value: Double(min(focus, snapshot.goalMinutes)), total: Double(max(1, snapshot.goalMinutes))).tint(.green)
+                 Text("Mục tiêu \(snapshot.goalMinutes) phút").font(.caption)
++                if let last = snapshot.lastStudyDay {
++                    let distance = Calendar.current.dateComponents([.day], from: Calendar.current.startOfDay(for: last), to: Calendar.current.startOfDay(for: entry.date)).day ?? 2
++                    let streak = (0...1).contains(distance) ? snapshot.currentStreak ?? 0 : 0
++                    Label("\(streak) ngày giữ nhịp", systemImage: "flame.fill").font(.caption.bold())
++                }
+                 if sameDay { Text("\(snapshot.dueCards) thẻ • \(snapshot.pendingTasks) việc").font(.caption) }
+                 else { Text("Mở Mầm để cập nhật thẻ ôn").font(.caption) }
+             } else { Text("Mở Mầm để bắt đầu").font(.subheadline) }
+         }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+-            .foregroundStyle(Color(red: 0.21, green: 0.25, blue: 0.20))
+-            .containerBackground(for: .widget) { Color(red: 0.83, green: 0.90, blue: 0.77) }
++            .foregroundStyle(Color.adaptive(0x354033, 0xE4ECDE))
++            .containerBackground(for: .widget) { Color.adaptive(0xD4E6C4, 0x304431) }
+             .widgetURL(URL(string: "mamstudy://focus"))
+     }
+ }
+@@ -113,5 +118,5 @@
+ }
+ @main
+ struct MamWidgetBundle: WidgetBundle {
+-    var body: some Widget { MamScheduleWidget(); MamRhythmWidget() }
++    var body: some Widget { MamScheduleWidget(); MamRhythmWidget(); FocusLiveActivity() }
+ }
+--- a/docs/DEVICE-QA.md
++++ b/docs/DEVICE-QA.md
+@@ -26,3 +26,24 @@
+ | Khả năng đọc | Màn hình nhỏ, chữ lớn, VoiceOver, bàn phím tiếng Việt, xoay iPad; nút lưu/xóa vẫn truy cập được. |
+ 
+ Đồng hồ và thống kê không đo được sự chú ý thực tế. WidgetKit có thể trì hoãn việc vẽ lại theo chính sách hệ thống. Không đánh dấu mục báo thức/widget đạt chỉ vì Simulator hiển thị giao diện.
++
++## Bổ sung nghiệm thu bản 1.1
++
++| Tình huống | Kết quả cần có |
++| --- | --- |
++| Live Activity Full | Bắt đầu 5 phút, khóa màn hình: mầm, tên môn, đồng hồ giảm, thanh tiến độ tăng. Chạm mở đúng Tập trung. |
++| Máy có Dynamic Island | Thử dạng compact, minimal khi có hoạt động khác, nhấn giữ expanded; đồng hồ không bị cắt. |
++| Tạm dừng/tiếp tục | Pause trong app rồi khóa máy: đồng hồ đứng yên. Resume: cộng đúng thời gian còn lại, không tính thời gian nghỉ. |
++| Hết giờ khi app mở | Thử từ tab Hôm nay, Ôn thẻ, Tập trung: phiên chỉ được lưu một lần, không vượt thời lượng; có haptic nếu bật và thẻ nhận mầm. |
++| Hết giờ ở nền/đóng app | Đồng hồ Activity về 0, hiển thị đến giờ nghỉ khi hệ thống đánh dấu stale. Mở app: lưu đúng một phiên, kết thúc Activity. Không yêu cầu có haptic UIKit lúc app đóng. |
++| Hủy/kết thúc sớm | Activity biến mất. Lưu sớm chỉ ghi số giây đã học; bỏ phiên không cộng phút/XP/streak. |
++| Tắt quyền/thiếu extension | Phiên focus vẫn hoạt động; app báo trạng thái thực tế. Basic không hiện công tắc khả dụng. |
++| Tắt/bật Live Activity | Tắt gỡ hoạt động, bật lại khi phiên đang chạy tạo lại được; vuốt bỏ hoạt động rồi sửa thẻ không làm nó liên tục xuất hiện lại. |
++| Streak | Tạo 5 phút đã lưu hoặc ôn 5 thẻ khác nhau: tăng ngày một lần. Ôn lặp một thẻ không đủ 5 thẻ. Chuỗi hôm qua còn đến hết hôm nay. |
++| Undo & lịch sử | Undo xóa lượt chấm đó và tính lại XP/streak; sửa/xóa thẻ vẫn thấy snapshot của lượt ôn mới. Log cũ chưa có snapshot ghi rõ. |
++| Biểu đồ & heatmap | Đổi 7/30/90 ngày, đổi phút/lượt ôn, kéo chọn ngày; so số với lịch sử. Mỗi biểu đồ có một đường mục tiêu. |
++| Dark mode | Bật theo hệ thống/sáng/tối, mở lại app, thử Form/sheet/bàn phím/chart/widget; chữ rõ trên mọi màu thẻ. |
++| Lật thẻ | Đáp án không hiện trước lúc lật, không bị ngược chữ, bàn phím đóng trước khi lật; thẻ kế tiếp không chớp lộ đáp án. |
++| Haptic/Reduce Motion | Tắt haptic thì các thao tác không rung. Bật Giảm chuyển động: lật/đổi tab/nhận mầm không có hiệu ứng xoay/nhảy. |
++| Nâng cấp JSON | Nhập backup 1.0, kiểm tra tên/mục tiêu/cards/lịch sử/focus; xuất mới rồi nhập lại. Không mất dữ liệu hoặc cộng thời gian lúc đã tạm dừng. |
++| Nhắc nghỉ | Đặt nghỉ rồi bắt đầu focus mới: không còn thông báo giờ nghỉ cũ chen ngang. |
+--- a/docs/SIGNING.md
++++ b/docs/SIGNING.md
+@@ -26,14 +26,18 @@
+ 
+ ## Bản Basic
+ 
+-`MamStudyBasic` không nhúng widget và không yêu cầu App Groups. Lịch học, todo, Focus, thống kê, ghi chú, flashcard và AlarmKit vẫn có trong app. Đây là lựa chọn nếu profile/công cụ ký của bạn không hỗ trợ widget.
++`MamStudyBasic` không nhúng widget/Live Activity và không yêu cầu App Groups. Lịch học, todo, Focus, thống kê, ghi chú, flashcard và AlarmKit vẫn có trong app. Đây là lựa chọn nếu profile/công cụ ký của bạn không hỗ trợ widget.
+ 
+ Bản Basic và bản đầy đủ có cùng bundle ID; đổi bản có thể thay thế app. Dữ liệu có được giữ hay không còn phụ thuộc cách cài, cùng chữ ký/team và có gỡ app hay không. Hãy xuất JSON trước khi thay bản.
+ 
+ ## Báo thức
+ 
+-App tối thiểu iOS 17, nhưng AlarmKit chỉ gọi trong nhánh iOS 26+. Cần cấp quyền **Báo thức** riêng; quyền **Thông báo** không thay thế quyền này. Project dùng báo thức theo lịch, không dùng countdown/snooze của AlarmKit và không có Live Activity đếm ngược.
++App tối thiểu iOS 17, nhưng AlarmKit chỉ gọi trong nhánh iOS 26+. Cần cấp quyền **Báo thức** riêng; quyền **Thông báo** không thay thế quyền này. Project dùng báo thức theo lịch, không dùng countdown/snooze của AlarmKit và có Live Activity riêng cho phiên Focus ở bản 1.1 đầy đủ.
+ 
+ Apple thiết kế AlarmKit để phát báo thức qua chế độ im lặng/Tập trung. Khả năng thực tế của bản ký cần kiểm tra trên iPhone bằng nút thử 30 giây; thử cả khi khóa màn hình và khi app không mở. Thiết bị hết pin/tắt nguồn không thể chạy báo thức từ app.
+ 
+ Nguồn: [Apple — Meet AlarmKit](https://developer.apple.com/videos/play/wwdc2025/230/), [Apple — App Groups](https://developer.apple.com/documentation/xcode/configuring-app-groups).
++
++## Live Activity của phiên tập trung
++
++Bản `MamStudy` nhúng `FocusLiveActivity` trong `MamStudyWidgets.appex`; Info.plist app có `NSSupportsLiveActivities = YES`. Không dùng remote push. Giữ extension khi ký lại; bật Hoạt động trực tiếp trong cài đặt iPhone nếu bị tắt. Đồng hồ dùng ActivityKit, không lấy dữ liệu đếm giây từ snapshot App Group. Chi tiết vòng đời khi ở nền trong [UPGRADE-v1.1.md](UPGRADE-v1.1.md).
+--- a/project.yml
++++ b/project.yml
+@@ -8,8 +8,8 @@
+   base:
+     SWIFT_VERSION: "5.0"
+     IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+-    MARKETING_VERSION: "1.0.0"
+-    CURRENT_PROJECT_VERSION: "1"
++    MARKETING_VERSION: "1.1.0"
++    CURRENT_PROJECT_VERSION: "2"
+     TARGETED_DEVICE_FAMILY: "1,2"
+     CODE_SIGN_STYLE: Automatic
+     DEVELOPMENT_TEAM: ""
+--- a/scripts/build-ios.sh
++++ b/scripts/build-ios.sh
+@@ -21,9 +21,9 @@
+ mkdir -p "build/$scheme/logs"
+ # Remove only previous generated outputs: a failed rebuild must not expose an old IPA.
+ rm -f "build/$scheme/$scheme-unsigned.ipa" "build/$scheme/SHA256SUMS.txt"
++xcodegen generate --spec project.yml 2>&1 | tee "build/$scheme/logs/xcodegen.log"
+ python3 scripts/validate_project.py 2>&1 | tee "build/$scheme/logs/structure.log"
+ swift test -Xswiftc -warnings-as-errors -Xswiftc -strict-concurrency=complete 2>&1 | tee "build/$scheme/logs/core-tests.log"
+-xcodegen generate --spec project.yml 2>&1 | tee "build/$scheme/logs/xcodegen.log"
+ xcodebuild -version > "build/$scheme/logs/toolchain.txt"
+ xcodebuild -showsdks >> "build/$scheme/logs/toolchain.txt"
+ xcodebuild -project MamStudy.xcodeproj -scheme "$scheme" -configuration Release \
+--- a/scripts/validate_project.py
++++ b/scripts/validate_project.py
+@@ -3,6 +3,8 @@
+ import json
+ import plistlib
+ import struct
++import re
++from collections import Counter
+ from pathlib import Path
+ import sys
+ 
+@@ -24,17 +26,30 @@
+             expected = round(float(icon["size"].split("x")[0]) * float(icon["scale"].removesuffix("x")))
+             assert width == height == expected, (image, width, height, expected)
+             assert depth == 8 and color == 2, "App icons must be opaque RGB"
+-required = ["App/MamStudyApp.swift", "App/ReminderService.swift", "Widget/MamWidgets.swift", "Package.swift", ".github/workflows/build-ios.yml"]
++required = ["App/MamStudyApp.swift", "App/ReminderService.swift", "Widget/MamWidgets.swift", "Package.swift", ".github/workflows/build-ios.yml",
++            "Core/StudyProgress.swift", "Shared/FocusActivityAttributes.swift", "App/FocusActivityService.swift",
++            "Widget/FocusLiveActivity.swift", "App/ReviewHistoryView.swift", "Shared/AdaptiveColor.swift"]
+ for name in required:
+     assert (root / name).is_file(), name
+ app_plist = plistlib.loads((root / "Config/App-Info.plist").read_bytes())
+ assert app_plist["NSAlarmKitUsageDescription"]
+ assert app_plist["StudyAppGroup"] == "$(STUDY_APP_GROUP)"
+ assert app_plist["StudyWidgetsEnabled"] == "$(STUDY_WIDGETS_ENABLED)"
++assert app_plist["NSSupportsLiveActivities"] is True
++assert app_plist.get("UIUserInterfaceStyle") != "Light", "Dark mode must not be blocked by Info.plist"
+ widget_plist = plistlib.loads((root / "Config/Widget-Info.plist").read_bytes())
+ assert widget_plist["StudyAppGroup"] == app_plist["StudyAppGroup"]
+ entitlements = plistlib.loads((root / "Config/MamStudy.entitlements").read_bytes())
+ assert entitlements["com.apple.security.application-groups"] == [app_plist["StudyAppGroup"]]
+ assert widget_plist["NSExtension"]["NSExtensionPointIdentifier"] == "com.apple.widgetkit-extension"
+ print("PASS: plist, privacy manifest, icon sizes/RGB, required files, widget group wiring")
++print("PASS: Live Activity declaration and system/light/dark configuration")
++project = root / "MamStudy.xcodeproj/project.pbxproj"
++if project.is_file():
++    contents = project.read_text()
++    counts = Counter(re.findall(r'/\* (\w+\.swift) in Sources \*/ = \{isa = PBXBuildFile;', contents))
++    for directory, expected in {"App": 2, "Core": 3, "Shared": 3, "Widget": 1}.items():
++        for source in (root / directory).glob("*.swift"):
++            assert counts[source.name] == expected, f"Regenerate Xcode project: {source.name} has {counts[source.name]} source entries, expected {expected}"
++    print("PASS: every Swift file belongs to the expected app/basic/widget targets")
+ print("Run swift test for core behavior and scripts/build-ios.sh on macOS for iOS compile.")

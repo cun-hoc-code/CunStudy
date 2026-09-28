@@ -1,0 +1,5 @@
+"NSCameraUsageDescription" = "Mam uses the camera when you choose to scan a document.";
+"NSMicrophoneUsageDescription" = "Mam uses the microphone when you choose to record a lecture.";
+"NSFaceIDUsageDescription" = "Use Face ID to unlock your study notebook.";
+"NSCalendarsFullAccessUsageDescription" = "Mam reads calendars you select to suggest free time and writes schedules only when you request it.";
+"NSAlarmKitUsageDescription" = "Mam uses alarms to remind you to prepare for classes and study sessions.";

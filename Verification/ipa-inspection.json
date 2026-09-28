@@ -1,0 +1,36 @@
+{
+  "file": "MamStudy-unsigned.ipa",
+  "bytes": 780907,
+  "sha256": "543b49c8d8f12d7b790acb1d625ff0435815b9a36524c461624d5d3545ce6378",
+  "zip_valid": true,
+  "bundles": [
+    {
+      "bundle": "Payload/MamStudy.app/PlugIns/MamStudyWidgets.appex",
+      "identifier": "com.cunz.mamstudy.widgets",
+      "version": "1.0.0",
+      "minimum_os": "17.0",
+      "cpu": "arm64",
+      "mach_o": "0xfeedfacf",
+      "executable_type": 2,
+      "live_activities": false,
+      "signature_directory": false,
+      "platform": 2,
+      "built_sdk": "26.2.0",
+      "binary_minimum_os": "17.0.0"
+    },
+    {
+      "bundle": "Payload/MamStudy.app",
+      "identifier": "com.cunz.mamstudy",
+      "version": "1.0.0",
+      "minimum_os": "17.0",
+      "cpu": "arm64",
+      "mach_o": "0xfeedfacf",
+      "executable_type": 2,
+      "live_activities": false,
+      "signature_directory": false,
+      "platform": 2,
+      "built_sdk": "26.2.0",
+      "binary_minimum_os": "17.0.0"
+    }
+  ]
+}

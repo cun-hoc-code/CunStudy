@@ -1,0 +1,895 @@
+--- a/.gitignore
++++ b/.gitignore
+@@ -9,5 +9,10 @@
+ xcuserdata/
+ *.mobileprovision
+ *.p12
++*.pfx
++*.key
++__pycache__/
++*.pyc
++*.p12
+ *.p8
+ DerivedData/
+--- a/App/AppStore.swift
++++ b/App/AppStore.swift
+@@ -12,7 +12,7 @@
+     @Published var reviewUndoAvailable = false
+     let reminders = ReminderService()
+     private let disk: DiskStore
+-    private var previousReview: (Flashcard, UUID)?
++    private var previousReview: ReviewUndo?
+ 
+     init() {
+         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+@@ -31,6 +31,7 @@
+         do {
+             try StateCodec.validate(next)
+             try disk.save(next)
++            if let previousReview, !previousReview.canRestore(in: next) { clearReviewUndo() }
+             state = next
+             publishSnapshot()
+             reminders.reconcile(state)
+@@ -45,6 +46,8 @@
+         reminders.reconcile(state)
+     }
+     func publishSnapshot() {
++        guard !readOnly else { widgetMessage = "Hãy khôi phục dữ liệu trước khi cập nhật widget."; return }
++        guard WidgetStorage.isEnabled else { widgetMessage = "Bản Basic không có widget. Cài bản đầy đủ để dùng tiện ích."; return }
+         let today = StudyStats.daily(state.sessions, ending: Date(), days: 1).first?.minutes ?? 0
+         let value = WidgetSnapshot(updatedAt: Date(), lessons: state.lessons,
+             pendingTasks: state.tasks.filter { !$0.done }.count,
+@@ -88,23 +91,32 @@
+         guard let active = state.activeFocus, let end = active.endDate, end <= Date() else { return }
+         finishFocus()
+     }
+-    func review(_ card: Flashcard, rating: RecallRating) {
+-        guard let current = state.cards.first(where: { $0.id == card.id }) else { return }
++    @discardableResult
++    func review(_ card: Flashcard, rating: RecallRating) -> Bool {
++        guard let current = state.cards.first(where: { $0.id == card.id }), current == card else { return false }
+         let now = Date()
+         let log = ReviewLog(cardID: card.id, date: now, rating: rating, wasNew: current.isNew)
+-        if change({ s in upsert(ReviewEngine.graded(current, rating: rating, at: now), in: &s.cards); s.reviews.append(log) }) {
+-            previousReview = (current, log.id); reviewUndoAvailable = true
++        let graded = ReviewEngine.graded(current, rating: rating, at: now)
++        if change({ s in upsert(graded, in: &s.cards); s.reviews.append(log) }) {
++            previousReview = ReviewUndo(before: current, after: graded, logID: log.id); reviewUndoAvailable = true
++            return true
+         }
++        return false
+     }
+-    func undoReview() {
+-        guard let (card, logID) = previousReview else { return }
+-        if change({ upsert(card, in: &$0.cards); $0.reviews.removeAll { $0.id == logID } }) {
+-            previousReview = nil; reviewUndoAvailable = false
++    @discardableResult
++    func undoReview() -> UUID? {
++        guard let undo = previousReview, let restored = undo.restored(state) else { clearReviewUndo(); return nil }
++        if change({ $0 = restored }) {
++            clearReviewUndo()
++            return undo.before.id
+         }
++        return nil
+     }
++    func clearReviewUndo() { previousReview = nil; reviewUndoAvailable = false }
+     func exportData() throws -> URL {
++        guard !readOnly else { throw StudyError.invalid("Dữ liệu chưa đọc được. Hãy khôi phục trước khi xuất bản sao lưu mới.") }
+         let url = FileManager.default.temporaryDirectory.appendingPathComponent("MamStudy-backup.json")
+-        try StateCodec.encode(state).write(to: url, options: .atomic)
++        try StateCodec.encode(StateCodec.backupSnapshot(state, at: Date())).write(to: url, options: .atomic)
+         return url
+     }
+     func readImport(_ url: URL) throws -> StudyState {
+@@ -112,30 +124,28 @@
+         defer { if access { url.stopAccessingSecurityScopedResource() } }
+         let values = try url.resourceValues(forKeys: [.fileSizeKey])
+         guard (values.fileSize ?? 0) <= 25 * 1024 * 1024 else { throw StudyError.invalid("File lớn hơn 25 MB.") }
+-        var value = try StateCodec.decode(Data(contentsOf: url))
+-        // Importing a backup must not create hours of accidental focus time.
+-        if var active = value.activeFocus {
+-            active.runningSince = nil
+-            value.activeFocus = active
+-        }
+-        return value
++        return try StateCodec.decode(Data(contentsOf: url))
+     }
+     func restore(_ value: StudyState) {
+         do {
++            let value = StateCodec.restoredSnapshot(value)
+             try StateCodec.validate(value)
+             try FileManager.default.createDirectory(at: disk.directory, withIntermediateDirectories: true)
+             if FileManager.default.fileExists(atPath: disk.file.path) {
+-                let backup = disk.directory.appendingPathComponent("before-restore-\(UUID().uuidString).json")
+-                try FileManager.default.copyItem(at: disk.file, to: backup)
++                try Data(contentsOf: disk.file).write(to: disk.beforeRestore, options: .atomic)
+             }
+             try StateCodec.encode(value).write(to: disk.file, options: .atomic)
+-            state = value; readOnly = false; previousReview = nil; reviewUndoAvailable = false
++            state = value; readOnly = false; clearReviewUndo()
+             refresh()
+         } catch { errorMessage = "Chưa khôi phục: \(error.localizedDescription)" }
+     }
+     func restorePrevious() {
+         do { restore(try StateCodec.decode(Data(contentsOf: disk.previous))) }
+         catch { errorMessage = "Không đọc được bản trước: \(error.localizedDescription)" }
++    }
++    func restoreBeforeImport() {
++        do { restore(try StateCodec.decode(Data(contentsOf: disk.beforeRestore))) }
++        catch { errorMessage = "Chưa có bản trước lần nhập, hoặc bản đó không đọc được: \(error.localizedDescription)" }
+     }
+     func addDemo() {
+         _ = change { s in
+--- a/App/CardsView.swift
++++ b/App/CardsView.swift
+@@ -1,6 +1,7 @@
+ import SwiftUI
+ import AVFoundation
+ import UniformTypeIdentifiers
++import Combine
+ 
+ @MainActor
+ final class CardSpeech: ObservableObject {
+@@ -100,10 +101,11 @@
+     @State private var revealed = false
+     @State private var typed = ""
+     @State private var completed = 0
++    @State private var currentCardID: UUID?
+     var body: some View {
+         TimelineView(.periodic(from: .now, by: 10)) { context in
+             PaperPage {
+-                if let card = ReviewEngine.queue(store.state, deck: deck, at: context.date).first {
++                if let card = store.state.cards.first(where: { $0.id == currentCardID && !$0.suspended }) {
+                     HStack { Chip(text: card.deck, color: .lavender); Spacer(); Text("Đã ôn \(completed)").font(.caption) }
+                     PaperCard(color: .butter) {
+                         VStack(alignment: .leading, spacing: 18) {
+@@ -128,7 +130,10 @@
+                         LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 12) {
+                             ForEach(RecallRating.allCases) { rating in
+                                 Button {
+-                                    store.review(card, rating: rating); revealed = false; typed = ""; completed += 1; speech.stop()
++                                    if store.review(card, rating: rating) {
++                                        completed += 1
++                                        showNextCard()
++                                    }
+                                 } label: {
+                                     VStack(spacing: 3) { Text(rating.title); Text(ReviewEngine.intervalLabel(card, rating: rating, at: context.date)).font(.caption) }
+                                 }.buttonStyle(PencilButtonStyle(color: [.rose, .peach, .sage, .sky][rating.rawValue]))
+@@ -147,12 +152,26 @@
+                     }
+                 }
+                 if store.reviewUndoAvailable {
+-                    Button("Hoàn tác lần chấm vừa rồi") { store.undoReview(); revealed = false; typed = ""; completed = max(0, completed - 1) }.font(.subheadline)
+-                }
++                    Button("Hoàn tác lần chấm vừa rồi") {
++                        if let id = store.undoReview() {
++                            currentCardID = id; revealed = false; typed = ""; speech.stop()
++                            completed = max(0, completed - 1)
++                        }
++                    }.font(.subheadline)
++                }
++            }
++            .onChange(of: context.date) { _, _ in
++                // Keep the question stable while the user is answering it.
++                if currentCardID == nil { showNextCard() }
+             }
+         }
+         .navigationTitle("Một thẻ, một ý").navigationBarTitleDisplayMode(.inline)
++        .onAppear { store.clearReviewUndo(); showNextCard() }
+         .onDisappear { speech.stop() }
++    }
++    private func showNextCard() {
++        revealed = false; typed = ""; speech.stop()
++        currentCardID = ReviewEngine.queue(store.state, deck: deck, at: Date()).first?.id
+     }
+ }
+ 
+@@ -162,10 +181,7 @@
+     @State var value: Flashcard
+     @State private var deleting = false
+     private var existing: Bool { store.state.cards.contains { $0.id == value.id } }
+-    private var valid: Bool {
+-        !value.front.trimmed.isEmpty && !value.deck.trimmed.isEmpty &&
+-        (value.kind == .cloze ? value.front.range(of: "\\{\\{.+?\\}\\}", options: .regularExpression) != nil : !value.back.trimmed.isEmpty)
+-    }
++    private var valid: Bool { value.hasValidContent }
+     var body: some View {
+         NavigationStack {
+             Form {
+--- a/App/FocusView.swift
++++ b/App/FocusView.swift
+@@ -53,7 +53,10 @@
+             }
+             Button { store.startFocus(subject: subject, minutes: minutes) } label: { Label("Trồng một mầm mới", systemImage: "play.fill") }.buttonStyle(PencilButtonStyle())
+             Button("Nghỉ \(store.state.preferences.breakMinutes) phút") {
+-                Task { await reminders.startBreak(minutes: store.state.preferences.breakMinutes); breakMessage = true }
++                Task {
++                    breakMessage = await reminders.startBreak(minutes: store.state.preferences.breakMinutes)
++                    if !breakMessage { store.errorMessage = reminders.problems.first ?? "Chưa đặt được giờ nghỉ." }
++                }
+             }.font(.subheadline)
+         }
+     }
+@@ -92,9 +95,11 @@
+                     }
+                 }
+                 PaperCard {
+-                    Chart(Array(days.enumerated()), id: \.offset) { pair in
+-                        BarMark(x: .value("Ngày", pair.element.date, unit: .day), y: .value("Phút", pair.element.minutes))
+-                            .foregroundStyle(Pencil.green.gradient).cornerRadius(4)
++                    Chart {
++                        ForEach(Array(days.enumerated()), id: \.offset) { pair in
++                            BarMark(x: .value("Ngày", pair.element.date, unit: .day), y: .value("Phút", pair.element.minutes))
++                                .foregroundStyle(Pencil.green.gradient).cornerRadius(4)
++                        }
+                         RuleMark(y: .value("Mục tiêu", store.state.preferences.dailyFocusMinutes))
+                             .foregroundStyle(.orange.opacity(0.5)).lineStyle(StrokeStyle(dash: [4]))
+                     }.frame(height: 190).chartYAxisLabel("phút")
+--- a/App/MamStudyApp.swift
++++ b/App/MamStudyApp.swift
+@@ -1,5 +1,6 @@
+ import SwiftUI
+ import UserNotifications
++import UIKit
+ 
+ final class ForegroundNotifications: NSObject, UNUserNotificationCenterDelegate {
+     func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
+--- a/App/ReminderService.swift
++++ b/App/ReminderService.swift
+@@ -3,6 +3,7 @@
+ import SwiftUI
+ import UserNotifications
+ import AlarmKit
++import UIKit
+ 
+ @available(iOS 26.0, *)
+ struct StudyAlarmMetadata: AlarmMetadata { var lessonID: String }
+@@ -16,7 +17,8 @@
+     private var latest: StudyState?
+     private var running = false
+     private var confirmedAlarms: [UUID: Lesson] = [:]
+-    private var testAlarmID: UUID?
++    // Stable across app restarts; reconciliation must not cancel a pending test.
++    private let testAlarmID = UUID(uuidString: "98201801-7B39-4A1C-8658-731AC8BB774C")!
+     private let center = UNUserNotificationCenter.current()
+ 
+     func requestNotifications() async {
+@@ -33,7 +35,11 @@
+     }
+     func updatePermissionLabels() async {
+         let settings = await center.notificationSettings()
+-        notificationPermission = settings.authorizationStatus == .authorized ? "Đã cho phép" : "Chưa cho phép đầy đủ"
++        if settings.authorizationStatus == .authorized {
++            notificationPermission = settings.soundSetting == .enabled ? "Đã cho phép âm thanh" : "Đã cho phép, âm thanh đang tắt"
++        } else if settings.authorizationStatus == .provisional {
++            notificationPermission = "Đang gửi yên lặng"
++        } else { notificationPermission = "Chưa cho phép" }
+         if #available(iOS 26.0, *) {
+             alarmPermission = AlarmManager.shared.authorizationState == .authorized ? "Đã cho phép" : "Chưa cho phép"
+         } else { alarmPermission = "Cần iOS 26 trở lên" }
+@@ -46,6 +52,16 @@
+         guard !running else { return }
+         running = true
+         Task {
++            var backgroundID = UIBackgroundTaskIdentifier.invalid
++            backgroundID = UIApplication.shared.beginBackgroundTask(withName: "Save study reminders") {
++                if backgroundID != .invalid {
++                    UIApplication.shared.endBackgroundTask(backgroundID)
++                    backgroundID = .invalid
++                }
++            }
++            defer {
++                if backgroundID != .invalid { UIApplication.shared.endBackgroundTask(backgroundID) }
++            }
+             while let next = latest {
+                 latest = nil
+                 await sync(next)
+@@ -90,6 +106,7 @@
+         let old = await center.pendingNotificationRequests()
+         center.removePendingNotificationRequests(withIdentifiers: old.filter { $0.identifier.hasPrefix("mam-") && $0.identifier != "mam-break" }.map(\.identifier))
+         if !requests.isEmpty && !canNotify { issues.append("Thông báo chưa được cấp quyền. Vào Cài đặt trong app để bật.") }
++        if !requests.isEmpty && canNotify && settings.soundSetting != .enabled { issues.append("Âm thanh thông báo đang tắt. Kiểm tra Cài đặt iPhone nếu muốn nghe nhắc học.") }
+         let ordered = requests.sorted {
+             (($0.trigger as? UNCalendarNotificationTrigger)?.nextTriggerDate() ?? .distantFuture) <
+             (($1.trigger as? UNCalendarNotificationTrigger)?.nextTriggerDate() ?? .distantFuture)
+@@ -104,7 +121,7 @@
+             }
+         }
+         let alarms = state.lessons.filter { $0.enabled && $0.reminder == .alarm && ($0.weekly || (ScheduleEngine.oneOffFire($0) ?? .distantPast) > now) }
+-        if #available(iOS 26.0, *) {
++        if #available(iOS 26.0, *), AlarmManager.shared.authorizationState == .authorized {
+             do {
+                 let existing = try AlarmManager.shared.alarms
+                 let desired = Set(alarms.map(\.id))
+@@ -112,27 +129,28 @@
+                     try AlarmManager.shared.cancel(id: alarm.id)
+                     confirmedAlarms.removeValue(forKey: alarm.id)
+                 }
+-                if !alarms.isEmpty && AlarmManager.shared.authorizationState != .authorized {
+-                    issues.append("Báo thức chưa được cấp quyền. Các lịch chọn Báo thức hiện chưa được đặt.")
+-                } else {
+-                    let ids = Set(existing.map(\.id))
+-                    for lesson in alarms {
+-                        if confirmedAlarms[lesson.id] == lesson && ids.contains(lesson.id) { alarmCount += 1; continue }
+-                        do {
+-                            if ids.contains(lesson.id) { try AlarmManager.shared.cancel(id: lesson.id) }
+-                            try await scheduleAlarm(lesson)
+-                            confirmedAlarms[lesson.id] = lesson; alarmCount += 1
+-                        } catch { issues.append("\(lesson.title): chưa đặt được báo thức. \(error.localizedDescription)") }
+-                    }
++                let ids = Set(existing.map(\.id))
++                for lesson in alarms {
++                    if confirmedAlarms[lesson.id] == lesson && ids.contains(lesson.id) { alarmCount += 1; continue }
++                    do {
++                        if ids.contains(lesson.id) { try AlarmManager.shared.cancel(id: lesson.id) }
++                        try await scheduleAlarm(lesson)
++                        confirmedAlarms[lesson.id] = lesson; alarmCount += 1
++                    } catch { issues.append("\(lesson.title): chưa đặt được báo thức. \(error.localizedDescription)") }
+                 }
+             } catch { issues.append("Không đọc được danh sách báo thức: \(error.localizedDescription)") }
+-        } else if !alarms.isEmpty { issues.append("Báo thức hệ thống cần iOS 26+. Chọn Thông báo nếu bạn dùng iOS cũ hơn.") }
++        } else if !alarms.isEmpty {
++            if #available(iOS 26.0, *) { issues.append("Báo thức chưa được cấp quyền. Các lịch chọn Báo thức hiện chưa được đặt.") }
++            else { issues.append("Báo thức hệ thống cần iOS 26+. Chọn Thông báo nếu bạn dùng iOS cũ hơn.") }
++        }
+         problems = Array(Set(issues)).sorted()
+         status = "\(alarmCount) báo thức • \(notificationCount) thông báo đã đặt"
+     }
+ 
+     private func request(id: String, content: UNMutableNotificationContent, date: Date) -> UNNotificationRequest {
+-        let components = Calendar.current.dateComponents([.year, .month, .day, .hour, .minute, .second], from: date)
++        var components = ScheduleEngine.calendar().dateComponents([.year, .month, .day, .hour, .minute, .second], from: date)
++        components.calendar = ScheduleEngine.calendar()
++        components.timeZone = .current
+         return .init(identifier: id, content: content, trigger: UNCalendarNotificationTrigger(dateMatching: components, repeats: false))
+     }
+ 
+@@ -167,16 +185,22 @@
+                 let alert = AlarmPresentation.Alert(title: "Báo thức thử của Mầm", stopButton: .init(text: "Tắt", textColor: .white, systemImageName: "checkmark"))
+                 let attributes = AlarmAttributes<StudyAlarmMetadata>(presentation: .init(alert: alert), tintColor: .green)
+                 let config = AlarmManager.AlarmConfiguration<StudyAlarmMetadata>.alarm(schedule: .fixed(Date().addingTimeInterval(30)), attributes: attributes)
+-                if let testAlarmID { try? AlarmManager.shared.cancel(id: testAlarmID) }
+-                let id = UUID(); testAlarmID = id
+-                _ = try await AlarmManager.shared.schedule(id: id, configuration: config)
++                try? AlarmManager.shared.cancel(id: testAlarmID)
++                _ = try await AlarmManager.shared.schedule(id: testAlarmID, configuration: config)
+                 status = "Đã đặt báo thức thử sau 30 giây. Hãy khóa màn hình để kiểm tra."
+             } catch { problems = ["Không đặt được báo thức thử: \(error.localizedDescription)"] }
+         }
+     }
+-    func startBreak(minutes: Int) async {
++    func startBreak(minutes: Int) async -> Bool {
++        let settings = await center.notificationSettings()
++        guard settings.authorizationStatus == .authorized || settings.authorizationStatus == .provisional else {
++            problems = ["Hãy cấp quyền thông báo trong Cài đặt của Mầm trước khi đặt giờ nghỉ."]
++            return false
++        }
+         let content = UNMutableNotificationContent(); content.title = "Hết giờ nghỉ"; content.body = "Bạn sẵn sàng cho một mầm mới chưa?"; content.sound = .default
+-        do { try await center.add(request(id: "mam-break", content: content, date: Date().addingTimeInterval(Double(minutes * 60)))) }
+-        catch { problems = [error.localizedDescription] }
++        do {
++            try await center.add(request(id: "mam-break", content: content, date: Date().addingTimeInterval(Double(minutes * 60))))
++            return true
++        } catch { problems = [error.localizedDescription]; return false }
+     }
+ }
+--- a/App/SettingsView.swift
++++ b/App/SettingsView.swift
+@@ -12,6 +12,7 @@
+     @State private var pendingImport: StudyState?
+     @State private var restoreConfirm = false
+     @State private var previousConfirm = false
++    @State private var beforeImportConfirm = false
+     @State private var message: String?
+     var body: some View {
+         NavigationStack {
+@@ -22,7 +23,10 @@
+                     Stepper("Phiên mặc định: \(preferences.focusMinutes) phút", value: $preferences.focusMinutes, in: 5...120, step: 5)
+                     Stepper("Giờ nghỉ: \(preferences.breakMinutes) phút", value: $preferences.breakMinutes, in: 1...30)
+                     Stepper("Thẻ mới: \(preferences.newCardsPerDay) / ngày", value: $preferences.newCardsPerDay, in: 1...100)
+-                    Button("Lưu thiết lập") { if store.change({ $0.preferences = preferences }) { message = "Đã lưu thiết lập." } }
++                    Button("Lưu thiết lập") {
++                        preferences.name = preferences.name.trimmed.isEmpty ? "Bạn" : preferences.name.trimmed
++                        if store.change({ $0.preferences = preferences }) { message = "Đã lưu thiết lập." }
++                    }
+                 }
+                 Section {
+                     LabeledContent("Báo thức", value: reminders.alarmPermission)
+@@ -40,8 +44,10 @@
+                 }
+                 Section {
+                     Text(store.widgetMessage).font(.subheadline)
+-                    Button("Gửi lại dữ liệu cho widget") { store.publishSnapshot() }
+-                    Text("Nhấn giữ màn hình chính → Sửa → Thêm tiện ích → Mầm. Chọn Lịch tiếp theo hoặc Nhịp học.").font(.footnote)
++                    if WidgetStorage.isEnabled {
++                        Button("Gửi lại dữ liệu cho widget") { store.publishSnapshot() }.disabled(store.readOnly)
++                        Text("Nhấn giữ màn hình chính → Sửa → Thêm tiện ích → Mầm. Chọn Lịch tiếp theo hoặc Nhịp học.").font(.footnote)
++                    }
+                 } header: { Text("Widget màn hình chính") } footer: {
+                     Text("Sau mỗi lần lưu lịch, Mầm gửi dữ liệu mới và yêu cầu iOS cập nhật widget. iOS có thể trì hoãn thời điểm vẽ lại. Bản ký phải giữ widget extension và quyền App Groups phù hợp.")
+                 }
+@@ -51,6 +57,7 @@
+                     }
+                     Button("Nhập bản sao lưu") { importing = true }
+                     Button("Khôi phục bản lưu trước đó") { previousConfirm = true }
++                    Button("Lấy lại dữ liệu trước lần nhập gần nhất") { beforeImportConfirm = true }
+                     if store.state.lessons.isEmpty && store.state.tasks.isEmpty && store.state.cards.isEmpty && store.state.notes.isEmpty {
+                         Button("Thử dữ liệu mẫu") { store.addDemo() }
+                     }
+@@ -79,6 +86,9 @@
+             .confirmationDialog("Khôi phục bản lưu trước lần thay đổi gần nhất?", isPresented: $previousConfirm, titleVisibility: .visible) {
+                 Button("Khôi phục", role: .destructive) { store.restorePrevious(); preferences = store.state.preferences }
+             }
++            .confirmationDialog("Lấy lại dữ liệu trước lần nhập gần nhất?", isPresented: $beforeImportConfirm, titleVisibility: .visible) {
++                Button("Lấy lại dữ liệu", role: .destructive) { store.restoreBeforeImport(); preferences = store.state.preferences }
++            }
+             .alert("Mầm", isPresented: Binding(get: { message != nil }, set: { if !$0 { message = nil } })) { Button("OK") { message = nil } } message: { Text(message ?? "") }
+         }
+     }
+--- a/Config/App-Info.plist
++++ b/Config/App-Info.plist
+@@ -13,9 +13,11 @@
+   <key>LSRequiresIPhoneOS</key><true/>
+   <key>NSAlarmKitUsageDescription</key><string>Mầm dùng báo thức để nhắc bạn chuẩn bị đi học và bắt đầu tự học đúng giờ, kể cả khi khóa màn hình.</string>
+   <key>StudyAppGroup</key><string>$(STUDY_APP_GROUP)</string>
++  <key>StudyWidgetsEnabled</key><string>$(STUDY_WIDGETS_ENABLED)</string>
+   <key>UIApplicationSceneManifest</key><dict><key>UIApplicationSupportsMultipleScenes</key><false/></dict>
+   <key>UILaunchScreen</key><dict/>
+   <key>UIUserInterfaceStyle</key><string>Light</string>
+   <key>UISupportedInterfaceOrientations</key><array><string>UIInterfaceOrientationPortrait</string><string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string></array>
++  <key>UISupportedInterfaceOrientations~ipad</key><array><string>UIInterfaceOrientationPortrait</string><string>UIInterfaceOrientationPortraitUpsideDown</string><string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string></array>
+   <key>CFBundleURLTypes</key><array><dict><key>CFBundleURLName</key><string>com.cunz.mamstudy</string><key>CFBundleURLSchemes</key><array><string>mamstudy</string></array></dict></array>
+ </dict></plist>
+--- a/Core/Models.swift
++++ b/Core/Models.swift
+@@ -180,11 +180,17 @@
+     var suspended = false
+     var createdAt = Date()
+     var isNew: Bool { reviews == 0 }
++    static let clozePattern = "(?s)\\{\\{(.+?)\\}\\}"
++    var hasValidContent: Bool {
++        !deck.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
++        !front.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
++        (kind == .cloze ? front.range(of: Self.clozePattern, options: .regularExpression) != nil : !back.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
++    }
+     var question: String {
+-        kind == .cloze ? front.replacingOccurrences(of: "\\{\\{(.*?)\\}\\}", with: "[…]", options: .regularExpression) : front
++        kind == .cloze ? front.replacingOccurrences(of: Self.clozePattern, with: "[…]", options: .regularExpression) : front
+     }
+     var answer: String {
+-        kind == .cloze ? front.replacingOccurrences(of: "{{", with: "").replacingOccurrences(of: "}}", with: "") : back
++        kind == .cloze ? front.replacingOccurrences(of: Self.clozePattern, with: "$1", options: .regularExpression) : back
+     }
+ }
+ 
+--- a/Core/Persistence.swift
++++ b/Core/Persistence.swift
+@@ -8,16 +8,51 @@
+ enum StateCodec {
+     static func encode(_ state: StudyState) throws -> Data {
+         let encoder = JSONEncoder()
+-        encoder.dateEncodingStrategy = .iso8601
++        let format = Date.ISO8601FormatStyle(includingFractionalSeconds: true)
++        encoder.dateEncodingStrategy = .custom { date, encoder in
++            var container = encoder.singleValueContainer()
++            try container.encode(format.format(date))
++        }
+         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+-        return try encoder.encode(state)
++        let data = try encoder.encode(state)
++        guard data.count <= 25 * 1024 * 1024 else { throw StudyError.invalid("Dữ liệu vượt 25 MB. Hãy rút gọn các ghi chú hoặc bộ thẻ quá lớn.") }
++        return data
+     }
+     static func decode(_ data: Data) throws -> StudyState {
+         guard data.count <= 25 * 1024 * 1024 else { throw StudyError.invalid("Bản sao lưu lớn hơn 25 MB.") }
+-        let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .iso8601
++        let decoder = JSONDecoder()
++        let fractional = Date.ISO8601FormatStyle(includingFractionalSeconds: true)
++        let legacy = Date.ISO8601FormatStyle()
++        decoder.dateDecodingStrategy = .custom { decoder in
++            let container = try decoder.singleValueContainer()
++            let text = try container.decode(String.self)
++            if let date = try? fractional.parse(text) { return date }
++            if let date = try? legacy.parse(text) { return date }
++            throw DecodingError.dataCorruptedError(in: container, debugDescription: "Invalid ISO-8601 date")
++        }
+         let state = try decoder.decode(StudyState.self, from: data)
+         try validate(state)
+         return state
++    }
++
++    /// Freeze the exported copy, without stopping the timer running in the app.
++    static func backupSnapshot(_ state: StudyState, at now: Date) -> StudyState {
++        var copy = state
++        if var active = copy.activeFocus {
++            active.pause(at: now)
++            if active.savedSeconds >= active.plannedSeconds {
++                if !copy.sessions.contains(where: { $0.id == active.id }) { copy.sessions.append(active.finish(at: now)) }
++                copy.activeFocus = nil
++            } else { copy.activeFocus = active }
++        }
++        return copy
++    }
++
++    /// A historical timer must never count the time between backup and restore.
++    static func restoredSnapshot(_ state: StudyState) -> StudyState {
++        var copy = state
++        copy.activeFocus?.runningSince = nil
++        return copy
+     }
+     static func validate(_ state: StudyState) throws {
+         guard state.schemaVersion == 1 else { throw StudyError.invalid("Phiên bản dữ liệu chưa được hỗ trợ.") }
+@@ -31,10 +66,18 @@
+                   (0..<1440).contains(lesson.startMinute), (1...720).contains(lesson.durationMinutes),
+                   (0...1440).contains(lesson.leadMinutes),
+                   lesson.weekdays.allSatisfy({ (1...7).contains($0) }),
++                  Set(lesson.weekdays).count == lesson.weekdays.count,
+                   !lesson.weekly || !lesson.weekdays.isEmpty else { throw StudyError.invalid("Lịch học có thời gian không hợp lệ.") }
+         }
++        for task in state.tasks {
++            guard !task.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
++                  unique(task.subtasks), task.subtasks.allSatisfy({ !$0.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }),
++                  !task.remind || task.due != nil else { throw StudyError.invalid("Công việc hoặc danh sách bước nhỏ không hợp lệ.") }
++        }
+         for card in state.cards {
+-            guard (0...3650).contains(card.intervalDays), (1.3...3.0).contains(card.ease), card.reviews >= 0 else {
++            guard card.hasValidContent, (0...3650).contains(card.intervalDays), (1.3...3.0).contains(card.ease),
++                  (0...10_000_000).contains(card.reviews), (0...10_000_000).contains(card.repetitions),
++                  (0...10_000_000).contains(card.lapses), (0...1).contains(card.learningStep) else {
+                 throw StudyError.invalid("Dữ liệu ôn tập không hợp lệ.")
+             }
+         }
+@@ -49,7 +92,8 @@
+         }
+         if let active = state.activeFocus {
+             guard (60...14400).contains(active.plannedSeconds), active.savedSeconds <= active.plannedSeconds + 1,
+-                  active.segments.allSatisfy({ $0.end >= $0.start }) else { throw StudyError.invalid("Đồng hồ tập trung không hợp lệ.") }
++                  active.segments.allSatisfy({ $0.end >= $0.start }),
++                  !state.sessions.contains(where: { $0.id == active.id }) else { throw StudyError.invalid("Đồng hồ tập trung không hợp lệ.") }
+             for pair in zip(active.segments, active.segments.dropFirst()) where pair.1.start < pair.0.end {
+                 throw StudyError.invalid("Phiên đang chạy có khoảng trùng nhau.")
+             }
+@@ -69,11 +113,13 @@
+     let directory: URL
+     var file: URL { directory.appendingPathComponent("mam-study.json") }
+     var previous: URL { directory.appendingPathComponent("mam-study.previous.json") }
++    var beforeRestore: URL { directory.appendingPathComponent("mam-study.before-restore.json") }
+     func load() throws -> StudyState {
+         guard FileManager.default.fileExists(atPath: file.path) else { return StudyState() }
+         return try StateCodec.decode(Data(contentsOf: file))
+     }
+     func save(_ state: StudyState) throws {
++        try StateCodec.validate(state)
+         let data = try StateCodec.encode(state)
+         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+         if FileManager.default.fileExists(atPath: file.path) {
+--- a/Core/ReviewEngine.swift
++++ b/Core/ReviewEngine.swift
+@@ -1,4 +1,20 @@
+ import Foundation
++
++struct ReviewUndo {
++    let before: Flashcard
++    let after: Flashcard
++    let logID: UUID
++    func canRestore(in state: StudyState) -> Bool {
++        state.cards.first(where: { $0.id == after.id }) == after && state.reviews.contains(where: { $0.id == logID })
++    }
++    func restored(_ state: StudyState) -> StudyState? {
++        guard canRestore(in: state), let index = state.cards.firstIndex(where: { $0.id == before.id }) else { return nil }
++        var copy = state
++        copy.cards[index] = before
++        copy.reviews.removeAll { $0.id == logID }
++        return copy
++    }
++}
+ 
+ /// Small, transparent SM-2-inspired scheduler with two learning steps.
+ /// It is not Anki's FSRS engine and does not claim personalized memory predictions.
+@@ -51,8 +67,12 @@
+         let pool = state.cards.filter { !$0.suspended && (deck == nil || $0.deck == deck) }
+         let learnedToday = Set(state.reviews.filter { $0.wasNew && calendar.isDate($0.date, inSameDayAs: now) }.map(\.cardID)).count
+         let remaining = max(0, state.preferences.newCardsPerDay - learnedToday)
+-        let due = pool.filter { !$0.isNew && $0.due <= now }.sorted { $0.due < $1.due }
+-        let new = pool.filter(\.isNew).sorted { $0.createdAt < $1.createdAt }.prefix(remaining)
++        let due = pool.filter { !$0.isNew && $0.due <= now }.sorted {
++            $0.due == $1.due ? $0.id.uuidString < $1.id.uuidString : $0.due < $1.due
++        }
++        let new = pool.filter { $0.isNew && $0.due <= now }.sorted {
++            $0.createdAt == $1.createdAt ? $0.id.uuidString < $1.id.uuidString : $0.createdAt < $1.createdAt
++        }.prefix(remaining)
+         return due + new
+     }
+ 
+@@ -65,14 +85,15 @@
+ 
+     static func importTSV(_ text: String, deck: String) throws -> [Flashcard] {
+         var cards: [Flashcard] = []
+-        let lines = text.replacingOccurrences(of: "\r\n", with: "\n").split(separator: "\n", omittingEmptySubsequences: false)
++        let normalized = text.hasPrefix("\u{FEFF}") ? String(text.dropFirst()) : text
++        let lines = normalized.replacingOccurrences(of: "\r\n", with: "\n").split(separator: "\n", omittingEmptySubsequences: false)
+         for (index, raw) in lines.enumerated() {
+             let line = String(raw).trimmingCharacters(in: .whitespacesAndNewlines)
+             if line.isEmpty || line.hasPrefix("#") { continue }
+-            let fields = String(raw).components(separatedBy: "\t")
+-            guard fields.count >= 2, !fields[0].trimmingCharacters(in: .whitespaces).isEmpty,
++            let fields = String(raw).components(separatedBy: "\t").map { $0.trimmingCharacters(in: .whitespaces) }
++            guard (2...3).contains(fields.count), !fields[0].trimmingCharacters(in: .whitespaces).isEmpty,
+                   !fields[1].trimmingCharacters(in: .whitespaces).isEmpty else {
+-                throw StudyError.invalid("Dòng \(index + 1): cần câu hỏi và đáp án, ngăn bằng phím Tab.")
++                throw StudyError.invalid("Dòng \(index + 1): cần 2 hoặc 3 cột: câu hỏi, đáp án và ví dụ (tùy chọn), ngăn bằng Tab.")
+             }
+             if fields[0].lowercased() == "front" && fields[1].lowercased() == "back" { continue }
+             var c = Flashcard()
+--- a/Core/Scheduling.swift
++++ b/Core/Scheduling.swift
+@@ -68,6 +68,7 @@
+ 
+     static func daily(_ sessions: [FocusSession], ending now: Date, days: Int,
+                       calendar: Calendar = ScheduleEngine.calendar()) -> [(date: Date, minutes: Double)] {
++        guard days > 0 else { return [] }
+         let today = calendar.startOfDay(for: now)
+         return (0..<days).reversed().compactMap { distance in
+             guard let start = calendar.date(byAdding: .day, value: -distance, to: today),
+--- a/Package.swift
++++ b/Package.swift
+@@ -3,6 +3,7 @@
+ 
+ let package = Package(
+     name: "StudyCore",
++    platforms: [.macOS(.v13), .iOS(.v17)],
+     products: [.library(name: "StudyCore", targets: ["StudyCore"])],
+     targets: [
+         .target(name: "StudyCore", path: "Core"),
+--- a/Shared/WidgetStorage.swift
++++ b/Shared/WidgetStorage.swift
+@@ -1,6 +1,7 @@
+ import Foundation
+ 
+ enum WidgetStorage {
++    static var isEnabled: Bool { (Bundle.main.object(forInfoDictionaryKey: "StudyWidgetsEnabled") as? String) == "YES" }
+     static var groupID: String { Bundle.main.object(forInfoDictionaryKey: "StudyAppGroup") as? String ?? "group.com.cunz.mamstudy" }
+     static var directory: URL? { FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: groupID) }
+     static var url: URL? { directory?.appendingPathComponent("widget-snapshot.json") }
+--- a/Tests/CoreTests.swift
++++ b/Tests/CoreTests.swift
+@@ -77,9 +77,11 @@
+         XCTAssertEqual(card.lapses, 1); XCTAssertEqual(card.intervalDays, 0)
+     }
+     func testOverdueReviewsPrecedeNewCardsAndNewLimitPersists() {
+-        let now = Date(); var state = StudyState(); state.preferences.newCardsPerDay = 1
++        let now = date("2026-09-14T12:00:00Z"); var state = StudyState(); state.preferences.newCardsPerDay = 1
+         var old = Flashcard(); old.reviews = 5; old.due = now.addingTimeInterval(-60)
+-        let firstNew = Flashcard(); state.cards = [firstNew, Flashcard(), old]
++        var firstNew = Flashcard(); firstNew.createdAt = now.addingTimeInterval(-60); firstNew.due = now
++        var secondNew = Flashcard(); secondNew.createdAt = now; secondNew.due = now
++        state.cards = [firstNew, secondNew, old]
+         XCTAssertEqual(ReviewEngine.queue(state, at: now).map(\.id), [old.id, firstNew.id])
+         state.reviews.append(.init(cardID: firstNew.id, date: now, rating: .good, wasNew: true))
+         XCTAssertEqual(ReviewEngine.queue(state, at: now).map(\.id), [old.id])
+@@ -112,4 +114,93 @@
+         XCTAssertThrowsError(try disk.save(state))
+         XCTAssertEqual(try StateCodec.decode(Data(contentsOf: disk.previous)).preferences.name, "Bạn")
+     }
++
++    func testFractionalFocusDatesSurviveManyPauseResumeCycles() throws {
++        let start = date("2026-09-14T07:00:00Z")
++        // Whole-second JSON dates used to inflate these five 11.2-second segments to 60 seconds.
++        let segments = (0..<5).map { index in
++            let time = start.addingTimeInterval(Double(index * 20) + 0.9)
++            return FocusSegment(start: time, end: time.addingTimeInterval(11.2))
++        }
++        var state = StudyState()
++        state.sessions = [.init(id: UUID(), subject: "OOP", plannedSeconds: 60,
++            segments: segments, finishedAt: segments.last!.end, completed: false)]
++        let result = try StateCodec.decode(StateCodec.encode(state))
++        XCTAssertEqual(result.sessions[0].seconds, 56, accuracy: 0.01)
++        XCTAssertEqual(result.sessions[0].segments[0].start.timeIntervalSince(segments[0].start), 0, accuracy: 0.001)
++    }
++    func testBackupStillReadsLegacyWholeSecondDates() throws {
++        var state = StudyState(); var lesson = Lesson(); lesson.title = "Lịch cũ"; state.lessons = [lesson]
++        let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
++        XCTAssertEqual(try StateCodec.decode(encoder.encode(state)).lessons[0].title, "Lịch cũ")
++    }
++    func testExportFreezesCopyAndRestoreNeverResumesHistoricalTimer() {
++        let start = date("2026-09-14T07:00:00Z")
++        var state = StudyState()
++        state.activeFocus = .init(subject: "OOP", plannedSeconds: 1500, startedAt: start, runningSince: start)
++        let snapshot = StateCodec.backupSnapshot(state, at: start.addingTimeInterval(301))
++        XCTAssertFalse(state.activeFocus!.isPaused)
++        XCTAssertTrue(snapshot.activeFocus!.isPaused)
++        XCTAssertEqual(snapshot.activeFocus!.elapsed(at: start.addingTimeInterval(86400)), 301)
++        let restored = StateCodec.restoredSnapshot(state)
++        XCTAssertTrue(restored.activeFocus!.isPaused)
++        XCTAssertEqual(restored.activeFocus!.elapsed(at: start.addingTimeInterval(86400)), 0)
++        let ended = StateCodec.backupSnapshot(state, at: start.addingTimeInterval(86400))
++        XCTAssertNil(ended.activeFocus); XCTAssertEqual(ended.sessions.count, 1)
++        XCTAssertEqual(ended.sessions[0].seconds, 1500)
++    }
++    func testUndoDoesNotOverwriteAnEditedOrDeletedCard() {
++        var before = Flashcard(); before.front = "A"; before.back = "B"
++        let now = Date(), after = ReviewEngine.graded(before, rating: .good, at: Date())
++        let log = ReviewLog(cardID: before.id, date: now, rating: .good, wasNew: true)
++        let undo = ReviewUndo(before: before, after: after, logID: log.id)
++        var state = StudyState(); state.cards = [after]; state.reviews = [log]
++        XCTAssertEqual(undo.restored(state)?.cards, [before])
++        XCTAssertEqual(undo.restored(state)?.reviews, [])
++        state.cards[0].front = "Đã sửa"
++        XCTAssertNil(undo.restored(state))
++        state.cards = []
++        XCTAssertNil(undo.restored(state))
++    }
++    func testClozeConcealsAnswersAcrossNewlines() {
++        var card = Flashcard(); card.kind = .cloze; card.front = "Nhớ {{dòng 1\ndòng 2}} nhé"
++        XCTAssertTrue(card.hasValidContent)
++        XCTAssertEqual(card.question, "Nhớ […] nhé")
++        XCTAssertEqual(card.answer, "Nhớ dòng 1\ndòng 2 nhé")
++    }
++    func testNewCardInFutureAndDailyLimitAcrossDecks() {
++        let now = Date(); var state = StudyState(); state.preferences.newCardsPerDay = 1
++        var card = Flashcard(); card.deck = "OOP"; card.due = now.addingTimeInterval(600)
++        state.cards = [card]
++        XCTAssertTrue(ReviewEngine.queue(state, at: now).isEmpty)
++        state.cards[0].due = now
++        state.reviews = [.init(cardID: UUID(), date: now, rating: .easy, wasNew: true)]
++        XCTAssertTrue(ReviewEngine.queue(state, deck: "OOP", at: now).isEmpty)
++        XCTAssertEqual(ReviewEngine.queue(state, deck: "OOP", at: now.addingTimeInterval(86400)).count, 1)
++    }
++    func testTSVUnderstandsBOMAndRejectsExtraColumns() throws {
++        let cards = try ReviewEngine.importTSV("\u{FEFF}front\tback\r\n hello \t xin chào \t ví dụ ", deck: "EN")
++        XCTAssertEqual(cards.count, 1); XCTAssertEqual(cards[0].front, "hello")
++        XCTAssertEqual(cards[0].example, "ví dụ")
++        XCTAssertThrowsError(try ReviewEngine.importTSV("A\tB\tC\tLost", deck: "EN"))
++    }
++    func testInvalidStateCannotOverwriteGoodDiskData() throws {
++        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
++        defer { try? FileManager.default.removeItem(at: dir) }
++        let disk = DiskStore(directory: dir)
++        try disk.save(StudyState())
++        var bad = StudyState(); var card = Flashcard(); card.front = "A"; card.back = "B"; card.learningStep = -1; bad.cards = [card]
++        XCTAssertThrowsError(try disk.save(bad))
++        XCTAssertTrue(try disk.load().cards.isEmpty)
++        bad = StudyState(); var task = StudyTask(); task.title = "Bài tập"
++        let step = ChecklistItem(title: "Bước 1"); task.subtasks = [step, step]; bad.tasks = [task]
++        XCTAssertThrowsError(try StateCodec.validate(bad))
++    }
++    func testCompletedFocusCannotAlsoBeActiveInBackup() {
++        let now = Date()
++        let active = ActiveFocus(subject: "OOP", plannedSeconds: 60, startedAt: now, runningSince: now)
++        var state = StudyState(); state.activeFocus = active
++        state.sessions = [active.finish(at: now.addingTimeInterval(60))]
++        XCTAssertThrowsError(try StateCodec.validate(state))
++    }
+ }
+--- a/project.yml
++++ b/project.yml
+@@ -28,17 +28,19 @@
+     settings:
+       base:
+         PRODUCT_BUNDLE_IDENTIFIER: com.cunz.mamstudy
+-        PRODUCT_NAME: MamStudy
++        PRODUCT_NAME: $(TARGET_NAME)
+         INFOPLIST_FILE: Config/App-Info.plist
+         GENERATE_INFOPLIST_FILE: NO
+         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+         SUPPORTS_MACCATALYST: NO
++        STUDY_WIDGETS_ENABLED: NO
+ targets:
+   MamStudy:
+     templates: [MainApp]
+     settings:
+       base:
+         CODE_SIGN_ENTITLEMENTS: Config/MamStudy.entitlements
++        STUDY_WIDGETS_ENABLED: YES
+     dependencies:
+       - target: MamStudyWidgets
+         embed: true
+@@ -53,6 +55,7 @@
+       - path: Widget
+       - path: Shared
+       - path: Core
++      - path: Resources/PrivacyInfo.xcprivacy
+     settings:
+       base:
+         PRODUCT_BUNDLE_IDENTIFIER: com.cunz.mamstudy.widgets
+--- a/scripts/build-ios.sh
++++ b/scripts/build-ios.sh
+@@ -1,5 +1,6 @@
+ #!/bin/bash
+ set -euo pipefail
++cd "$(dirname "$0")/.."
+ 
+ scheme="${1:-MamStudy}"
+ case "$scheme" in MamStudy|MamStudyBasic) ;; *) echo "Unknown scheme: $scheme" >&2; exit 2;; esac
+@@ -7,29 +8,43 @@
+   echo "This script needs macOS with Xcode 26+. On Arch/Windows, use GitHub Actions." >&2
+   exit 2
+ fi
++if ! command -v xcodegen >/dev/null 2>&1; then
++  echo "XcodeGen is missing. On macOS install it with: brew install xcodegen" >&2
++  exit 2
++fi
+ major=$(xcodebuild -version | awk '/Xcode / {split($2, a, "."); print a[1]}')
++case "$major" in ''|*[!0-9]*) echo "Cannot determine Xcode version." >&2; exit 2;; esac
+ if [ "$major" -lt 26 ]; then
+   echo "Xcode 26+ is required to compile AlarmKit. Select an Xcode 26 installation first." >&2
+   exit 2
+ fi
+-mkdir -p "build/$scheme/logs" "build/$scheme/output/Payload"
+-swift test 2>&1 | tee "build/$scheme/logs/core-tests.log"
+-xcodegen generate --spec project.yml
++mkdir -p "build/$scheme/logs"
++# Remove only previous generated outputs: a failed rebuild must not expose an old IPA.
++rm -f "build/$scheme/$scheme-unsigned.ipa" "build/$scheme/SHA256SUMS.txt"
++python3 scripts/validate_project.py 2>&1 | tee "build/$scheme/logs/structure.log"
++swift test -Xswiftc -warnings-as-errors -Xswiftc -strict-concurrency=complete 2>&1 | tee "build/$scheme/logs/core-tests.log"
++xcodegen generate --spec project.yml 2>&1 | tee "build/$scheme/logs/xcodegen.log"
++xcodebuild -version > "build/$scheme/logs/toolchain.txt"
++xcodebuild -showsdks >> "build/$scheme/logs/toolchain.txt"
+ xcodebuild -project MamStudy.xcodeproj -scheme "$scheme" -configuration Release \
+   -destination 'generic/platform=iOS' -sdk iphoneos -derivedDataPath "build/$scheme/DerivedData" \
+-  -resultBundlePath "build/$scheme/result-$(date +%Y%m%d%H%M%S).xcresult" \
++  -resultBundlePath "build/$scheme/result-$(date +%Y%m%d%H%M%S)-$$.xcresult" \
+   CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+   build 2>&1 | tee "build/$scheme/logs/xcodebuild.log"
+-app_path="build/$scheme/DerivedData/Build/Products/Release-iphoneos/MamStudy.app"
++app_path="build/$scheme/DerivedData/Build/Products/Release-iphoneos/$scheme.app"
+ test -d "$app_path"
+-test -s "$app_path/MamStudy"
+-file "$app_path/MamStudy" | tee "build/$scheme/logs/binary.txt"
+-file "$app_path/MamStudy" | grep -q 'Mach-O'
++test -s "$app_path/$scheme"
++file "$app_path/$scheme" | tee "build/$scheme/logs/binary.txt"
++file "$app_path/$scheme" | grep -q 'Mach-O'
+ if [ "$scheme" = "MamStudy" ]; then
+   test -s "$app_path/PlugIns/MamStudyWidgets.appex/MamStudyWidgets"
++  file "$app_path/PlugIns/MamStudyWidgets.appex/MamStudyWidgets" | grep -q 'Mach-O'
+ fi
+-ditto "$app_path" "build/$scheme/output/Payload/MamStudy.app"
+-(cd "build/$scheme/output" && zip -qry "../$scheme-unsigned.ipa" Payload)
++staging=$(mktemp -d "$(pwd)/build/$scheme/staging.XXXXXX")
++trap 'rm -rf "$staging"' EXIT
++mkdir -p "$staging/Payload"
++ditto "$app_path" "$staging/Payload/$scheme.app"
++(cd "$staging" && zip -qry "../$scheme-unsigned.ipa" Payload)
+ unzip -t "build/$scheme/$scheme-unsigned.ipa"
+ shasum -a 256 "build/$scheme/$scheme-unsigned.ipa" > "build/$scheme/SHA256SUMS.txt"
+ echo "Created build/$scheme/$scheme-unsigned.ipa (unsigned; re-sign before installing)."
+--- a/scripts/validate_project.py
++++ b/scripts/validate_project.py
+@@ -2,6 +2,7 @@
+ """Structural checks only. This does NOT replace an iOS compile or device tests."""
+ import json
+ import plistlib
++import struct
+ from pathlib import Path
+ import sys
+ 
+@@ -15,14 +16,25 @@
+     data = json.loads(contents.read_text())
+     for icon in data.get("images", []):
+         if "filename" in icon:
+-            assert (contents.parent / icon["filename"]).is_file(), icon
++            image = contents.parent / icon["filename"]
++            assert image.is_file(), icon
++            png = image.read_bytes()
++            assert png[:8] == b"\x89PNG\r\n\x1a\n", image
++            width, height, depth, color = struct.unpack(">IIBB", png[16:26])
++            expected = round(float(icon["size"].split("x")[0]) * float(icon["scale"].removesuffix("x")))
++            assert width == height == expected, (image, width, height, expected)
++            assert depth == 8 and color == 2, "App icons must be opaque RGB"
+ required = ["App/MamStudyApp.swift", "App/ReminderService.swift", "Widget/MamWidgets.swift", "Package.swift", ".github/workflows/build-ios.yml"]
+ for name in required:
+     assert (root / name).is_file(), name
+ app_plist = plistlib.loads((root / "Config/App-Info.plist").read_bytes())
+ assert app_plist["NSAlarmKitUsageDescription"]
+ assert app_plist["StudyAppGroup"] == "$(STUDY_APP_GROUP)"
++assert app_plist["StudyWidgetsEnabled"] == "$(STUDY_WIDGETS_ENABLED)"
+ widget_plist = plistlib.loads((root / "Config/Widget-Info.plist").read_bytes())
+ assert widget_plist["StudyAppGroup"] == app_plist["StudyAppGroup"]
+-print("PASS: plist, privacy manifest, icon references, required files, widget group wiring")
++entitlements = plistlib.loads((root / "Config/MamStudy.entitlements").read_bytes())
++assert entitlements["com.apple.security.application-groups"] == [app_plist["StudyAppGroup"]]
++assert widget_plist["NSExtension"]["NSExtensionPointIdentifier"] == "com.apple.widgetkit-extension"
++print("PASS: plist, privacy manifest, icon sizes/RGB, required files, widget group wiring")
+ print("Run swift test for core behavior and scripts/build-ios.sh on macOS for iOS compile.")
