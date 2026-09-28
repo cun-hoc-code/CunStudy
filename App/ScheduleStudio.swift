@@ -2,7 +2,7 @@ import SwiftUI
 
 struct ScheduleStudio: View {
   @EnvironmentObject private var store: AppStore
-  @Environment(\.accessibilityReduceMotion) private var reduce
+  @Environment(\.mamReduceMotion) private var reduce
   @State private var selected = Date()
   @State private var mode = 1
   @State private var duration = 25

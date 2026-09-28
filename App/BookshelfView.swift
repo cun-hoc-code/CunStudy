@@ -179,7 +179,7 @@ struct BookReaderView: View {
   @EnvironmentObject private var store: AppStore
   @Environment(\.dismiss) private var dismiss
   @Environment(\.scenePhase) private var scenePhase
-  @Environment(\.accessibilityReduceMotion) private var reduceMotion
+  @Environment(\.mamReduceMotion) private var reduceMotion
 
   @State private var book: BookRecord
   @State private var layout: BookLayout?

@@ -112,7 +112,7 @@ struct PencilButtonStyle: PrimitiveButtonStyle {
 }
 
 private struct PencilPressVisualStyle: ButtonStyle {
-  @Environment(\.accessibilityReduceMotion) private var reduceMotion
+  @Environment(\.mamReduceMotion) private var reduceMotion
   @Environment(\.isEnabled) private var isEnabled
   let color: InkColor
   func makeBody(configuration: Configuration) -> some View {

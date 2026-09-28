@@ -1,7 +1,18 @@
 import SwiftUI
 
+private struct MamReduceMotionKey: EnvironmentKey {
+  static let defaultValue = false
+}
+
+extension EnvironmentValues {
+  var mamReduceMotion: Bool {
+    get { self[MamReduceMotionKey.self] }
+    set { self[MamReduceMotionKey.self] = newValue }
+  }
+}
+
 struct PaperReveal: ViewModifier {
-  @Environment(\.accessibilityReduceMotion) private var reduce
+  @Environment(\.mamReduceMotion) private var reduce
   @State private var appeared = false
   func body(content: Content) -> some View {
     content.opacity(appeared || reduce ? 1 : 0).scaleEffect(
@@ -25,7 +36,7 @@ struct SoftPressStyle: PrimitiveButtonStyle {
   }
 }
 private struct QuietPressStyle: ButtonStyle {
-  @Environment(\.accessibilityReduceMotion) private var reduce
+  @Environment(\.mamReduceMotion) private var reduce
   func makeBody(configuration: Configuration) -> some View {
     configuration.label
       .scaleEffect(configuration.isPressed && !reduce ? 0.985 : 1)
@@ -34,7 +45,7 @@ private struct QuietPressStyle: ButtonStyle {
   }
 }
 struct LeafCelebration: View {
-  @Environment(\.accessibilityReduceMotion) private var reduce
+  @Environment(\.mamReduceMotion) private var reduce
   @State private var expanded = false
   var body: some View {
     GeometryReader { geometry in
@@ -58,7 +69,7 @@ struct LeafCelebration: View {
   }
 }
 struct GrowingGarden: View {
-  @Environment(\.accessibilityReduceMotion) private var reduce
+  @Environment(\.mamReduceMotion) private var reduce
   @Environment(\.scenePhase) private var scene
   let progress: Double
   var active = false
@@ -90,7 +101,7 @@ struct GrowingGarden: View {
 }
 struct GardenTabBar: View {
   @EnvironmentObject private var store: AppStore
-  @Environment(\.accessibilityReduceMotion) private var reduce
+  @Environment(\.mamReduceMotion) private var reduce
   @Environment(\.dynamicTypeSize) private var size
   @Namespace private var leaf
   private let symbols = [
@@ -177,7 +188,7 @@ struct LayoutPicker: View {
 /// Finite stagger on hub entry; no repeating work after arrival.
 struct CascadeArrival: ViewModifier {
   let index: Int
-  @Environment(\.accessibilityReduceMotion) private var reduce
+  @Environment(\.mamReduceMotion) private var reduce
   @State private var arrived = false
   func body(content: Content) -> some View {
     content.opacity(arrived || reduce ? 1 : 0)

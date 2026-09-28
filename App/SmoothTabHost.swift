@@ -171,7 +171,7 @@ final class TabHostController: UIViewController {
           \.locale,
           Locale(identifier: store.state.studio.settings.language == "en" ? "en_US" : "vi_VN")
         )
-        .environment(\.accessibilityReduceMotion, reduceMotion)
+        .environment(\.mamReduceMotion, reduceMotion)
         .tint(Pencil.green)
         .foregroundStyle(Pencil.ink)
         .preferredColorScheme(store.state.preferences.appearance.colorScheme)

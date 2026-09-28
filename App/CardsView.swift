@@ -171,7 +171,7 @@ struct CardsView: View {
 
 private struct ReviewSessionView: View {
   @EnvironmentObject private var store: AppStore
-  @Environment(\.accessibilityReduceMotion) private var reduceMotion
+  @Environment(\.mamReduceMotion) private var reduceMotion
   @FocusState private var typing: Bool
   @StateObject private var speech = CardSpeech()
   let deck: String?

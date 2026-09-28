@@ -75,7 +75,7 @@ struct JournalEditor: View {
 }
 struct GoalsView: View {
   @EnvironmentObject private var store: AppStore
-  @Environment(\.accessibilityReduceMotion) private var reduce
+  @Environment(\.mamReduceMotion) private var reduce
   @State private var draft: LearningGoal?
   @State private var celebrate: UUID?
   var body: some View {

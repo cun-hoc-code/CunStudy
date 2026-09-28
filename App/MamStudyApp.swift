@@ -30,7 +30,7 @@ struct MamStudyApp: App {
           Locale(identifier: store.state.studio.settings.language == "en" ? "en_US" : "vi_VN")
         )
         .environment(
-          \.accessibilityReduceMotion,
+          \.mamReduceMotion,
           systemReduceMotion || store.state.studio.settings.reduceMotion
         )
         .onChange(of: scenePhase) { _, phase in
@@ -81,23 +81,23 @@ struct MamStudyApp: App {
 
 struct RootView: View {
   @EnvironmentObject private var store: AppStore
-  @Environment(\.accessibilityReduceMotion) private var reduceMotion
+  @Environment(\.mamReduceMotion) private var reduceMotion
   var body: some View {
     SmoothTabHost(store: store, reduceMotion: reduceMotion)
-    .safeAreaInset(edge: .bottom, spacing: 0) { GardenTabBar() }
-    .onChange(of: store.tab) { _, _ in
-      StudyHaptics.selection(enabled: store.state.preferences.haptics)
-    }
-    .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { _ in
-      // Any tab can be visible when a focus session ends. Disk is written only once.
-      if store.state.activeFocus != nil && !store.readOnly { store.settleFocus() }
-    }
-    .fullScreenCover(
-      isPresented: Binding(
-        get: { !store.state.preferences.hasOnboarded && !store.readOnly }, set: { _ in })
-    ) {
-      WelcomeView()
-    }
+      .safeAreaInset(edge: .bottom, spacing: 0) { GardenTabBar() }
+      .onChange(of: store.tab) { _, _ in
+        StudyHaptics.selection(enabled: store.state.preferences.haptics)
+      }
+      .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { _ in
+        // Any tab can be visible when a focus session ends. Disk is written only once.
+        if store.state.activeFocus != nil && !store.readOnly { store.settleFocus() }
+      }
+      .fullScreenCover(
+        isPresented: Binding(
+          get: { !store.state.preferences.hasOnboarded && !store.readOnly }, set: { _ in })
+      ) {
+        WelcomeView()
+      }
   }
 }
 

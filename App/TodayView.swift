@@ -237,7 +237,7 @@ struct LessonRow: View {
 }
 
 struct TaskCard: View {
-  @Environment(\.accessibilityReduceMotion) private var reduceMotion
+  @Environment(\.mamReduceMotion) private var reduceMotion
   @EnvironmentObject private var store: AppStore
   let value: StudyTask
   let edit: () -> Void

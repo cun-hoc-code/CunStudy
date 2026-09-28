@@ -4,7 +4,7 @@ struct FocusView: View {
   @EnvironmentObject private var store: AppStore
   @EnvironmentObject private var reminders: ReminderService
   @EnvironmentObject private var activity: FocusActivityService
-  @Environment(\.accessibilityReduceMotion) private var reduceMotion
+  @Environment(\.mamReduceMotion) private var reduceMotion
   @State private var subject = ""
   @State private var minutes = 25
   @State private var stopping = false
@@ -140,7 +140,7 @@ struct FocusView: View {
 
 private struct FocusCelebration: View {
   @EnvironmentObject private var store: AppStore
-  @Environment(\.accessibilityReduceMotion) private var reduceMotion
+  @Environment(\.mamReduceMotion) private var reduceMotion
   @State private var arrived = false
   @State private var burst = false
   let session: FocusSession

@@ -80,7 +80,10 @@ struct DeckToolsView: View {
   private func importDeck(_ url: URL) {
     busy = true
     Task {
-      defer { busy = false; ImportSource.discard(url) }
+      defer {
+        busy = false
+        ImportSource.discard(url)
+      }
       do {
         let values = try await Task.detached(priority: .userInitiated) { () -> [Flashcard] in
           if url.pathExtension.lowercased() == "apkg" { return try AnkiDeck.read(url) }
@@ -233,7 +236,7 @@ struct DraftCardEditor: View {
 struct QuickReview: View {
   @EnvironmentObject private var store: AppStore
   @Environment(\.dismiss) private var dismiss
-  @Environment(\.accessibilityReduceMotion) private var reduce
+  @Environment(\.mamReduceMotion) private var reduce
   let cards: [Flashcard]
   @State private var index = 0
   @State private var revealed = false

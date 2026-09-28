@@ -316,7 +316,7 @@ struct PaperPageCurl: UIViewControllerRepresentable {
 
     init(parent: PaperPageCurl) { self.parent = parent }
 
-    func controller(at index: Int) -> BookPageController {
+    fileprivate func controller(at index: Int) -> BookPageController {
       BookPageController(
         layout: parent.layout, pdfPage: parent.pdf?.page(at: index), title: parent.title,
         pageIndex: index, pageCount: max(1, parent.pageCount), tone: parent.tone)
