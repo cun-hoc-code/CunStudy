@@ -91,15 +91,16 @@ assert reader.count("ReadingFont(id:") >= 10, "Reader must expose at least ten r
 assert ".pageCurl" in reader and ".scroll" in reader, "Reader needs curl and reduced-motion modes"
 assert "fileprivate func controller(at" in reader, "Page controller access level is invalid"
 imports = (root / "App/ImportCenter.swift").read_text()
-for feature in ["PhotosPicker", "PDFDocument", "TextRecognition", "officeOpenXML", "TextFileDecoder"]:
+for feature in ["PhotosPicker", "PDFDocument", "TextRecognition", "NSAttributedString", "TextFileDecoder"]:
     assert feature in imports, feature
 assert "format = .docFormat" not in imports, "Legacy DOC import is not portable across iOS SDKs"
+assert "DocumentType.officeOpenXML" not in imports, "DOCX import must compile across iOS SDKs"
 motion = (root / "App/Motion.swift").read_text()
 app_root = (root / "App/MamStudyApp.swift").read_text()
 assert "var mamReduceMotion: Bool" in motion
 assert ".environment(\n          \\.accessibilityReduceMotion" not in app_root, "System Reduce Motion is read-only"
 project_spec = (root / "project.yml").read_text()
 assert "MARKETING_VERSION: 2.1.0" in project_spec
-assert "CURRENT_PROJECT_VERSION: '5'" in project_spec
+assert "CURRENT_PROJECT_VERSION: '6'" in project_spec
 print("PASS: v2 permissions, Managed entitlements, ambient audio and localization resources")
 print("PASS: v2.1 import center, book reader/page curl, ten fonts and interaction feedback")

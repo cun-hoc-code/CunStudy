@@ -153,20 +153,11 @@ actor ContentImporter {
           try TextFileDecoder.decode(Data(contentsOf: local)).prefix(2_000_000))
       } else if ["rtf", "rtfd", "doc", "docx", "html", "htm"].contains(ext) {
         let extracted = try? await MainActor.run {
-          let options: [NSAttributedString.DocumentReadingOptionKey: Any]
-          switch ext {
-          case "rtf": options = [.documentType: NSAttributedString.DocumentType.rtf]
-          case "rtfd": options = [.documentType: NSAttributedString.DocumentType.rtfd]
-          case "docx": options = [.documentType: NSAttributedString.DocumentType.officeOpenXML]
-          case "html", "htm": options = [.documentType: NSAttributedString.DocumentType.html]
-          default:
-            // Let Foundation inspect legacy .doc files. Some iOS SDKs do not expose
-            // the old docFormat constant even though the URL reader can still detect it.
-            options = [:]
-          }
+          // Let Foundation inspect the extension and file contents. Explicit Word
+          // document-type constants are not exposed consistently by every iOS SDK.
           return String(
             try NSAttributedString(
-              url: local, options: options, documentAttributes: nil
+              url: local, options: [:], documentAttributes: nil
             ).string.prefix(2_000_000))
         }
         d.extractedText = extracted ?? ""
